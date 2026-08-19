@@ -196,34 +196,81 @@ export function writeMarker(data: Record<string, unknown>): void {
   } catch { /* best-effort */ }
 }
 
+/**
+ * Whether THIS process runs under a process supervisor that relaunches it on
+ * exit (systemd `Restart=always`, etc). Detection: systemd sets
+ * `INVOCATION_ID` for every unit-started process. Under a supervisor the
+ * detached-helper relaunch is BOTH unnecessary (the supervisor re-executes
+ * the service) and unreliable (systemd's default `KillMode=control-group`
+ * kills every process in the service cgroup when the main process exits —
+ * the helper included, however detached). In that environment restart works
+ * by exiting and letting the supervisor relaunch, and restart confirmation
+ * relies on the intent marker alone within a freshness window.
+ */
+export function supervisorManaged(): boolean {
+  const id = process.env.INVOCATION_ID
+  return typeof id === 'string' && id !== ''
+}
+
+/** How fresh a supervisor-mode intent marker must be for this process to
+ * claim the restart. The supervisor relaunches within seconds; a much older
+ * marker belongs to a previous restart whose consume was skipped (e.g. the
+ * new instance never booted) and must not let a later MANUAL boot misreport
+ * as "restarted". */
+const SUPERVISOR_ACCEPT_WINDOW_MS = 10 * 60 * 1000
+
 /** Whether THIS process is the freshly-restarted instance. Exported for tests. */
 export function consumeRestartConfirmation(): RestartConfirmation | null {
   const marker = readMarker()
   if (marker === null) return null
-  const oldId = marker.fromInstanceId
+  const rawOld = marker.fromInstanceId
+  if (typeof rawOld !== 'string' || rawOld === INSTANCE_ID) {
+    try { fs.unlinkSync(markerPath()) } catch { /* ignore */ }
+    return null
+  }
+  const oldId = rawOld
+  const finish = (): RestartConfirmation | null => {
+    // Consume the marker NOW so a LATER ordinary boot of this profile cannot
+    // mistake itself for the restarted instance: B restarts from A, exits
+    // normally, then a manual C boot must NOT report "restarted from A".
+    try { fs.unlinkSync(markerPath()) } catch { /* ignore */ }
+    const result: RestartConfirmation = { fromInstanceId: oldId }
+    if (typeof marker.originSessionId === 'string') result.originSessionId = marker.originSessionId
+    if (typeof marker.originSource === 'string') result.originSource = marker.originSource
+    if (typeof marker.requestedAt === 'string') result.requestedAt = marker.requestedAt
+    return result
+  }
+  if (marker.supervisor === true) {
+    // Supervisor-managed environment: there is no helper confirmation
+    // (relaunchedAt/newPid) — the supervisor re-executed us. Accept only a
+    // FRESH intent marker (within the window): that is the evidence this
+    // boot is the supervised relaunch of the marker's author.
+    const ra = marker.requestedAt
+    const requested = typeof ra === 'string' ? Date.parse(ra) : Number.NaN
+    if (!Number.isFinite(requested) || Date.now() - requested > SUPERVISOR_ACCEPT_WINDOW_MS) {
+      // Stale supervisor intent (the relaunch never happened, or this is a
+      // much later MANUAL boot): clear it and report nothing.
+      try { fs.unlinkSync(markerPath()) } catch { /* ignore */ }
+      return null
+    }
+    return finish()
+  }
   const relaunched = typeof marker.relaunchedAt === 'string'
     && Number.isInteger(marker.newPid)
     && (marker.newPid as number) === process.pid
-  if (typeof oldId !== 'string' || oldId === INSTANCE_ID || !relaunched) {
-    // Stale, self-referential, or intent-only marker (the helper wrote it but
-    // never confirmed a relaunch — e.g. the helper died before spawning, and
-    // this process is a MANUAL boot): clear it and report nothing. Without
-    // the relaunchedAt/newPid check, a stale intent marker would make a
-    // manual boot falsely report "restarted" and show the "已重启" toast.
+  if (!relaunched) {
+    // Stale or intent-only marker in the NON-supervisor path (the helper
+    // wrote it but never confirmed a relaunch — e.g. the helper died before
+    // spawning, and this process is a MANUAL boot): clear it and report
+    // nothing. Without the relaunchedAt/newPid check, a stale intent marker
+    // would make a manual boot falsely report "restarted" and show the
+    // "已重启" toast.
     try { fs.unlinkSync(markerPath()) } catch { /* ignore */ }
     return null
   }
   // This is the exact process the helper spawned (newPid === process.pid),
-  // so it IS the freshly-restarted instance. Consume the marker NOW so a
-  // LATER ordinary boot of this profile cannot mistake itself for the
-  // restarted instance: B restarts from A, exits normally, then a manual C
-  // boot must NOT report "restarted from A".
-  try { fs.unlinkSync(markerPath()) } catch { /* ignore */ }
-  const result: RestartConfirmation = { fromInstanceId: oldId }
-  if (typeof marker.originSessionId === 'string') result.originSessionId = marker.originSessionId
-  if (typeof marker.originSource === 'string') result.originSource = marker.originSource
-  if (typeof marker.requestedAt === 'string') result.requestedAt = marker.requestedAt
-  return result
+  // so it IS the freshly-restarted instance.
+  return finish()
 }
 
 /**
@@ -302,13 +349,16 @@ export function clampModelDelayMs(raw: number, maxDelayMs: number): number {
   return Math.min(Math.max(desired, MIN_MODEL_DELAY_MS), maxDelayMs)
 }
 
-/** Startup housekeeping: prune old restart-helper logs so ~/.dsh does not
- * accumulate one file per restart forever. Best-effort, never throws. */
+/** Startup housekeeping: prune old restart-helper logs and helper scripts so
+ * ~/.dsh does not accumulate one file per restart forever. Only files older
+ * than the cutoff are removed, so a JUST-spawned helper (current restart in
+ * flight) is never touched. Best-effort, never throws. */
 export function pruneOldRestartLogs(maxAgeDays = 7): void {
   try {
     const cutoff = Date.now() - maxAgeDays * 24 * 3600 * 1000
     for (const name of fs.readdirSync(RUNTIME_DIR)) {
-      if (!name.startsWith('restart-helper-') || !name.endsWith('.log')) continue
+      if (!name.startsWith('restart-helper-')) continue
+      if (!name.endsWith('.log') && !name.endsWith('.cjs')) continue
       const full = path.join(RUNTIME_DIR, name)
       try {
         if (fs.statSync(full).mtimeMs < cutoff) fs.unlinkSync(full)
@@ -344,12 +394,19 @@ try {
 } catch { /* ignore */ }
 
 /**
- * Relaunch DSH. Returns immediately; the actual restart happens in a helper
- * that is fully detached from this process tree.
+ * Relaunch DSH. Returns immediately. Two modes:
+ *  - NORMAL (no supervisor): a detached helper waits for the old process to
+ *    exit and the port to free, then re-executes the same command line and
+ *    confirms the relaunch in the marker (newPid/relaunchedAt).
+ *  - SUPERVISOR (systemd `Restart=always` etc): no helper — systemd kills
+ *    the whole service cgroup (KillMode=control-group) and re-executes the
+ *    unit. The marker carries `supervisor: true` and the fresh intent; the
+ *    new process claims the restart within a freshness window.
  */
 function restartDsh(ctx, delayMs = 1500, origin: RestartOrigin = { source: 'http' }) {
   try {
     const port = resolvePort(ctx)
+    const supervisor = supervisorManaged()
     // Record restart intent: the new process reads this to confirm it IS the
     // restarted instance (its own instanceId differs from the recorded old),
     // and - when the restart was triggered from inside a session - which
@@ -360,7 +417,19 @@ function restartDsh(ctx, delayMs = 1500, origin: RestartOrigin = { source: 'http
       requestedAt,
       originSessionId: origin.sessionId,
       originSource: origin.source,
+      ...(supervisor ? { supervisor: true } : {}),
     })
+    if (supervisor) {
+      // The supervisor (systemd Restart=always) relaunches this service on
+      // exit; a detached helper would be killed with the cgroup anyway, and
+      // its relaunch would race the supervisor's own re-exec. Skip the
+      // helper: just exit (scheduleExit below) and let the supervisor act.
+      try {
+        appendLog(LOG_FILE, `${new Date().toISOString()} supervisor-managed restart requested (fromInstanceId=${INSTANCE_ID}); systemd will relaunch\n`)
+      } catch { /* ignore */ }
+      scheduleExit(ctx, delayMs)
+      return { ok: true, action: 'restart', note: isEnglishLocale(ctx) ? 'DeepSeek Harness is restarting' : 'DeepSeek Harness 正在重启' }
+    }
     // Replay the CURRENT invocation, portably (no hard-coded paths):
     // execArgv carries node flags (e.g. --import tsx/esm), argv the entry
     // script + app args. Spawned children inherit env, so any NODE_OPTIONS
@@ -524,40 +593,43 @@ function sessionsQuiescent(maxWaitMs) {
       windowsHide: true,
     })
     helper.unref()
-    // Best-effort pre-exit durability checkpoint: flush every live session
-    // before the exit timer starts so the visible write-behind window is
-    // small. Events appended after this point (e.g. this tool's own
-    // tool/result, or a message landing during the delay) are covered by
-    // Harness's `ctx.appExit` disposal final drain on session/disposed —
-    // that teardown lifecycle, not this flush, is the durability authority.
-    const scheduleExit = (): void => {
-      // Schedule the old process to exit AFTER the HTTP response flushes.
-      // Prefer DSH's `ctx.appExit` (graceful tree dispose); fall back to
-      // process.exit in non-standard embeddings.
-      setTimeout(() => {
-        const appExit = ctx.appExit
-        if (typeof appExit === 'function') {
-          appExit(0)
-        } else {
-          try { process.exit(0) } catch { /* ignore */ }
-        }
-      }, delayMs)
-    }
-    try {
-      const live = typeof ctx.sessions?.list === 'function' ? ctx.sessions.list() : []
-      if (live.length === 0) {
-        scheduleExit()
-      } else {
-        Promise.allSettled(live.map((session) => ctx.sessions.flush(session)))
-          .then(scheduleExit)
-          .catch(scheduleExit)
-      }
-    } catch {
-      scheduleExit()
-    }
+    scheduleExit(ctx, delayMs)
     return { ok: true, action: 'restart', note: isEnglishLocale(ctx) ? 'DeepSeek Harness is restarting' : 'DeepSeek Harness 正在重启' }
   } catch (e) {
     return { ok: false, action: 'restart', error: e.message }
+  }
+}
+
+/** Best-effort pre-exit durability checkpoint: flush every live session
+ * before the exit timer starts so the visible write-behind window is small.
+ * Events appended after this point (e.g. this tool's own tool/result, or a
+ * message landing during the delay) are covered by Harness's `ctx.appExit`
+ * disposal final drain on session/disposed — that teardown lifecycle, not
+ * this flush, is the durability authority. Then schedule the old process to
+ * exit AFTER the HTTP response flushes. Prefer DSH's `ctx.appExit` (graceful
+ * tree dispose); fall back to process.exit in non-standard embeddings. */
+function scheduleExit(ctx: any, delayMs: number): void {
+  const exit = (): void => {
+    setTimeout(() => {
+      const appExit = ctx.appExit
+      if (typeof appExit === 'function') {
+        appExit(0)
+      } else {
+        try { process.exit(0) } catch { /* ignore */ }
+      }
+    }, delayMs)
+  }
+  try {
+    const live = typeof ctx.sessions?.list === 'function' ? ctx.sessions.list() : []
+    if (live.length === 0) {
+      exit()
+    } else {
+      Promise.allSettled(live.map((session) => ctx.sessions.flush(session)))
+        .then(exit)
+        .catch(exit)
+    }
+  } catch {
+    exit()
   }
 }
 
@@ -968,12 +1040,14 @@ export function apply(ctx, config: Config) {
         name: 'restart_harness',
         description: isEnglishLocale(ctx)
           ? 'Restart the whole DeepSeek Harness process to reload plugins and config (profile cordis layers, settings, etc). '
-            + 'Provided by dsh-power-button (standalone): spawns a detached helper that waits for the old process to exit and the port to free, '
+            + 'Provided by dsh-power-button (standalone): normally spawns a detached helper that waits for the old process to exit and the port to free, '
             + 'then relaunches with the same command line and cwd, after which the old process exits. '
+            + 'Under a process supervisor (systemd Restart=always etc) the helper is skipped and the supervisor relaunches the service. '
             + 'The current session connection drops briefly and the page auto-reconnects. Returns ok and a note.'
           : '重启整个 DeepSeek Harness 进程，用于重新加载插件与配置（profile 的 cordis 组合、settings 等）。'
-            + '由 dsh-power-button 提供（独立实现）：派生一个 detach 的 helper，'
-            + '在旧进程退出并释放端口后以原命令行在原目录重新拉起，然后旧进程退出。'
+            + '由 dsh-power-button 提供（独立实现）：通常派生一个 detach 的 helper，'
+            + '在旧进程退出并释放端口后以原命令行在原目录重新拉起，然后旧进程退出；'
+            + '在进程托管环境（systemd Restart=always 等）下跳过 helper，由托管方重新拉起。'
             + '触发后当前会话连接会短暂中断，网页随后自动重连到新进程。'
             + '返回 ok 与说明文本。',
         parameters: {

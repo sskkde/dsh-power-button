@@ -54,6 +54,38 @@ describe('restart marker lifecycle', () => {
     expect(existsSync(markerPath())).toBe(false)
   })
 
+  it('accepts a FRESH supervisor intent marker (systemd relaunched us)', () => {
+    // Supervisor-managed restart (INVOCATION_ID env): no helper runs, so the
+    // marker never gains relaunchedAt/newPid. The new process claims the
+    // restart from the fresh intent marker within the acceptance window.
+    writeMarker({
+      fromInstanceId: 'instance-A',
+      requestedAt: new Date().toISOString(),
+      originSessionId: 'session-42',
+      originSource: 'command',
+      supervisor: true,
+    })
+    const result = consumeRestartConfirmation()
+    expect(result?.fromInstanceId).toBe('instance-A')
+    expect(result?.originSessionId).toBe('session-42')
+    expect(result?.originSource).toBe('command')
+    expect(existsSync(markerPath())).toBe(false)
+  })
+
+  it('rejects a STALE supervisor intent marker as a manual boot', () => {
+    // A supervisor marker older than the acceptance window must not let a
+    // much-later MANUAL boot misreport "restarted".
+    const stale = new Date(Date.now() - 30 * 60 * 1000).toISOString()
+    writeMarker({
+      fromInstanceId: 'instance-A',
+      requestedAt: stale,
+      supervisor: true,
+    })
+    const result = consumeRestartConfirmation()
+    expect(result).toBeNull()
+    expect(existsSync(markerPath())).toBe(false)
+  })
+
   it('rejects an intent-only marker (helper died before spawning) as a manual boot', () => {
     // restartDsh writes {fromInstanceId, requestedAt} BEFORE the helper spawns.
     // If the helper dies before confirming a relaunch (no newPid/relaunchedAt),

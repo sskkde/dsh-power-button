@@ -53,6 +53,18 @@ interface RestartOrigin {
 }
 /** Record restart intent. Exported for tests (isolated via DSH_HOME). */
 declare function writeMarker(data: Record<string, unknown>): void;
+/**
+ * Whether THIS process runs under a process supervisor that relaunches it on
+ * exit (systemd `Restart=always`, etc). Detection: systemd sets
+ * `INVOCATION_ID` for every unit-started process. Under a supervisor the
+ * detached-helper relaunch is BOTH unnecessary (the supervisor re-executes
+ * the service) and unreliable (systemd's default `KillMode=control-group`
+ * kills every process in the service cgroup when the main process exits —
+ * the helper included, however detached). In that environment restart works
+ * by exiting and letting the supervisor relaunch, and restart confirmation
+ * relies on the intent marker alone within a freshness window.
+ */
+declare function supervisorManaged(): boolean;
 /** Whether THIS process is the freshly-restarted instance. Exported for tests. */
 declare function consumeRestartConfirmation(): RestartConfirmation | null;
 /**
@@ -74,11 +86,13 @@ declare function redactCommandLine(parts: readonly string[]): string;
  * (config.maxDelayMs, schema-validated >= 1000) caps every outcome INCLUDING
  * the non-numeric fallback, so clamp(anything, maxDelayMs) ∈ [1000, maxDelayMs]. */
 declare function clampModelDelayMs(raw: number, maxDelayMs: number): number;
-/** Startup housekeeping: prune old restart-helper logs so ~/.dsh does not
- * accumulate one file per restart forever. Best-effort, never throws. */
+/** Startup housekeeping: prune old restart-helper logs and helper scripts so
+ * ~/.dsh does not accumulate one file per restart forever. Only files older
+ * than the cutoff are removed, so a JUST-spawned helper (current restart in
+ * flight) is never touched. Best-effort, never throws. */
 declare function pruneOldRestartLogs(maxAgeDays?: number): void;
 /** Render the notice text the session's model will see. */
 declare function renderRestartNoticeText(en: boolean, originSource?: string): string;
 declare function apply(ctx: any, config: Config): void;
 //#endregion
-export { Config, RestartOrigin, apply, clampModelDelayMs, consumeRestartConfirmation, inject, markerPath, name, pruneOldRestartLogs, redactCommandLine, renderRestartNoticeText, writeMarker };
+export { Config, RestartOrigin, apply, clampModelDelayMs, consumeRestartConfirmation, inject, markerPath, name, pruneOldRestartLogs, redactCommandLine, renderRestartNoticeText, supervisorManaged, writeMarker };
