@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest'
 import {
   consumeRestartConfirmation, writeMarker, markerPath,
   redactCommandLine, clampModelDelayMs, pruneOldRestartLogs,
-  renderRestartNoticeText,
+  renderRestartNoticeText, deliverRestartNotice,
 } from '../src/index.ts'
 
 describe('restart marker lifecycle', () => {
@@ -178,6 +178,42 @@ describe('renderRestartNoticeText', () => {
     const zh = renderRestartNoticeText(false, 'command')
     expect(zh).toContain('/restart')
     expect(zh).toContain(`pid ${process.pid}`)
+  })
+})
+
+describe('deliverRestartNotice', () => {
+  it('resumes the session with the deployment default model route', async () => {
+    // Regression: a route-less resume crashed the notification turn with
+    // `prompt variable "{{model}}" has no value for this assembly` — the
+    // session persona assembles {{model}} from the agent route, so resume
+    // must pass the same default selection the web host uses.
+    const resumedArgs: Array<Record<string, unknown>> = []
+    const fakeAgents = {
+      get: () => undefined,
+      resume: async (opts: Record<string, unknown>) => {
+        resumedArgs.push(opts)
+        return {
+          agent: { id: 'x', followup() {}, inject() {}, whenIdle: async () => {} },
+          dispose: async () => {},
+        }
+      },
+    }
+    const ctx = {
+      get: (key: string) => {
+        if (key === 'agents') return fakeAgents
+        if (key === 'agentDefaultModel') {
+          return { currentSelection: () => ({ provider: 'volces', model: 'glm-5.3' }) }
+        }
+        return undefined
+      },
+      settings: { get: () => ({ preference: 'en' }) },
+    }
+    const cfg = { notifySession: true, notifyMode: 'followup', enableModelTool: true, maxDelayMs: 5000, notifyDelayMs: 100 }
+    const info = { fromInstanceId: 'A', originSessionId: 'session-1', originSource: 'tool', requestedAt: new Date().toISOString() }
+    const ok = await deliverRestartNotice(ctx as never, cfg as never, info as never)
+    expect(ok).toBe(true)
+    expect(resumedArgs.length).toBe(1)
+    expect(resumedArgs[0].agentOptions).toEqual({ provider: 'volces', model: 'glm-5.3' })
   })
 })
 

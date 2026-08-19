@@ -861,7 +861,7 @@ async function composePresetSetup(
  * the agent services are not loaded yet; throws on permanent failures
  * (unknown session, corrupt persistence).
  */
-async function deliverRestartNotice(ctx: any, cfg: Config, info: RestartConfirmation): Promise<boolean> {
+export async function deliverRestartNotice(ctx: any, cfg: Config, info: RestartConfirmation): Promise<boolean> {
   const sessionId = info.originSessionId as string
   const agents = ctx.get?.('agents') as AgentsServiceShape | undefined
   if (agents === undefined || typeof agents.resume !== 'function' || typeof agents.get !== 'function') {
@@ -874,9 +874,30 @@ async function deliverRestartNotice(ctx: any, cfg: Config, info: RestartConfirma
   let handle: { dispose(): Promise<void> } | null = null
   if (agent === undefined) {
     const setup = await composePresetSetup(ctx, sessionId)
-    const resumed = await agents.resume(
-      setup === undefined ? { resumeSessionId: sessionId } : { resumeSessionId: sessionId, setup },
-    )
+    // Resume with the deployment's DEFAULT model route: the session's persona
+    // assembles `{{model}}` from the agent's route (deployment:persona etc),
+    // and a route-less resume fails prompt assembly (observed: notification
+    // turn crashed with 'prompt variable "{{model}}" has no value'). The web
+    // host passes the same selection (apiproxy agentOptions()).
+    let agentOptions: { provider: string, model: string } | undefined
+    try {
+      const defaults = ctx.get?.('agentDefaultModel') as
+        | { currentSelection?(): { provider?: string, model?: string } }
+        | undefined
+      const selection = defaults?.currentSelection?.()
+      if (
+        selection !== undefined
+        && typeof selection.provider === 'string' && selection.provider !== ''
+        && typeof selection.model === 'string' && selection.model !== ''
+      ) {
+        agentOptions = { provider: selection.provider, model: selection.model }
+      }
+    } catch { /* fall through: resume without options */ }
+    const resumed = await agents.resume({
+      resumeSessionId: sessionId,
+      ...(agentOptions !== undefined ? { agentOptions } : {}),
+      ...(setup !== undefined ? { setup } : {}),
+    })
     agent = resumed.agent
     handle = resumed
   }

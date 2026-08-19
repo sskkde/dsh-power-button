@@ -93,6 +93,16 @@ declare function clampModelDelayMs(raw: number, maxDelayMs: number): number;
 declare function pruneOldRestartLogs(maxAgeDays?: number): void;
 /** Render the notice text the session's model will see. */
 declare function renderRestartNoticeText(en: boolean, originSource?: string): string;
+/**
+ * Deliver the restart-complete notice to the session that requested the
+ * restart. Reuses the live agent when the web client already reconnected and
+ * resumed the session; otherwise resumes it from persistence (with its
+ * original agent preset mounted), delivers the notice, and disposes the
+ * handle after the notification turn settles. Returns false (retryable) when
+ * the agent services are not loaded yet; throws on permanent failures
+ * (unknown session, corrupt persistence).
+ */
+declare function deliverRestartNotice(ctx: any, cfg: Config, info: RestartConfirmation): Promise<boolean>;
 declare function apply(ctx: any, config: Config): void;
 //#endregion
-export { Config, RestartOrigin, apply, clampModelDelayMs, consumeRestartConfirmation, inject, markerPath, name, pruneOldRestartLogs, redactCommandLine, renderRestartNoticeText, supervisorManaged, writeMarker };
+export { Config, RestartOrigin, apply, clampModelDelayMs, consumeRestartConfirmation, deliverRestartNotice, inject, markerPath, name, pruneOldRestartLogs, redactCommandLine, renderRestartNoticeText, supervisorManaged, writeMarker };
