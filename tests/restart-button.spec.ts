@@ -204,6 +204,12 @@ describe('deliverRestartNotice', () => {
         if (key === 'agentDefaultModel') {
           return { currentSelection: () => ({ provider: 'volces', model: 'glm-5.3' }) }
         }
+        if (key === 'sessionPersistence') {
+          return { inspect: async () => ({ meta: { agentPreset: 'cordis' } }) }
+        }
+        if (key === 'agentPresets') {
+          return { resolve: async () => ({ id: 'cordis' }), mount: async () => {} }
+        }
         return undefined
       },
       settings: { get: () => ({ preference: 'en' }) },
@@ -214,6 +220,35 @@ describe('deliverRestartNotice', () => {
     expect(ok).toBe(true)
     expect(resumedArgs.length).toBe(1)
     expect(resumedArgs[0].agentOptions).toEqual({ provider: 'volces', model: 'glm-5.3' })
+  })
+
+  it('does not resume without the preset services (retryable instead)', async () => {
+    // Regression: composePresetSetup returning undefined used to resume a
+    // composition-less agent whose notification turn had no tools; it must
+    // now report retryable so the caller retries later.
+    const resumedArgs: Array<Record<string, unknown>> = []
+    const fakeAgents = {
+      get: () => undefined,
+      resume: async (opts: Record<string, unknown>) => {
+        resumedArgs.push(opts)
+        return { agent: { id: 'x', followup() {}, inject() {}, whenIdle: async () => {} }, dispose: async () => {} }
+      },
+    }
+    const ctx = {
+      get: (key: string) => {
+        if (key === 'agents') return fakeAgents
+        if (key === 'agentDefaultModel') {
+          return { currentSelection: () => ({ provider: 'volces', model: 'glm-5.3' }) }
+        }
+        return undefined // sessionPersistence / agentPresets absent -> retryable
+      },
+      settings: { get: () => ({ preference: 'en' }) },
+    }
+    const cfg = { notifySession: true, notifyMode: 'followup', enableModelTool: true, maxDelayMs: 5000, notifyDelayMs: 100 }
+    const info = { fromInstanceId: 'A', originSessionId: 'session-1', originSource: 'tool', requestedAt: new Date().toISOString() }
+    const ok = await deliverRestartNotice(ctx as never, cfg as never, info as never)
+    expect(ok).toBe(false)
+    expect(resumedArgs.length).toBe(0)
   })
 })
 

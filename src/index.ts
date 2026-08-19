@@ -96,7 +96,7 @@ export const Config: z<Config> = z.object({
   maxDelayMs: z.number().default(5000).min(1000),
   notifySession: z.boolean().default(true),
   notifyMode: z.union([z.const('followup'), z.const('inject')] as const).default('followup'),
-  notifyDelayMs: z.number().default(5000).min(0),
+  notifyDelayMs: z.number().default(8000).min(0),
 })
 
 const BASE = '/api/dsh-power-button'
@@ -827,7 +827,7 @@ export function renderRestartNoticeText(en: boolean, originSource?: string): str
 async function composePresetSetup(
   ctx: any,
   sessionId: string,
-): Promise<((agentCtx: unknown) => Promise<void>) | undefined> {
+): Promise<{ setup?: (agentCtx: unknown) => Promise<void>, retryable?: boolean }> {
   try {
     const persistence = ctx.get?.('sessionPersistence') as
       | { inspect?(id: string): Promise<{ meta?: { agentPreset?: string } }> }
@@ -835,9 +835,9 @@ async function composePresetSetup(
     const presets = ctx.get?.('agentPresets') as
       | { resolve?(id: string): Promise<{ id: string }>, mount?(agentCtx: unknown, id: string): Promise<void> }
       | undefined
-    if (persistence === undefined || persistence.inspect === undefined) return undefined
+    if (persistence === undefined || persistence.inspect === undefined) return { retryable: true }
     if (presets === undefined || presets.resolve === undefined || presets.mount === undefined) {
-      return undefined
+      return { retryable: true }
     }
     // Bind to locals: the guards above do not narrow across the closure below.
     const inspect = persistence.inspect
@@ -845,11 +845,19 @@ async function composePresetSetup(
     const mount = presets.mount
     const inspected = await inspect(sessionId)
     const presetId = inspected?.meta?.agentPreset
-    if (typeof presetId !== 'string' || presetId === '') return undefined
+    if (typeof presetId !== 'string' || presetId === '') return {} // no preset - host composition only
     const resolved = await resolve(presetId)
-    return async (agentCtx: unknown) => { await mount(agentCtx, resolved.id) }
-  } catch { /* no preset info -> compose nothing */ }
-  return undefined
+    return { setup: async (agentCtx: unknown) => { await mount(agentCtx, resolved.id) } }
+  } catch (error) {
+    // Early-boot service races (persistence / preset roster still loading)
+    // look like inspect/resolve failures; log the reason so a silent
+    // tool-less notification turn is diagnosable, and report retryable so
+    // the caller retries instead of resuming a composition-less agent.
+    try {
+      appendLog(LOG_FILE, `${new Date().toISOString()} composePresetSetup failed for ${sessionId}: ${String(error)}\n`)
+    } catch { /* ignore */ }
+    return { retryable: true }
+  }
 }
 
 /**
@@ -873,7 +881,11 @@ export async function deliverRestartNotice(ctx: any, cfg: Config, info: RestartC
   let agent = agents.get(sessionId)
   let handle: { dispose(): Promise<void> } | null = null
   if (agent === undefined) {
-    const setup = await composePresetSetup(ctx, sessionId)
+    const compose = await composePresetSetup(ctx, sessionId)
+    // Services/preset not ready yet (early boot): report retryable instead of
+    // resuming a composition-less agent whose notification turn would have no
+    // tools.
+    if (compose.retryable === true) return false
     // Resume with the deployment's DEFAULT model route: the session's persona
     // assembles `{{model}}` from the agent's route (deployment:persona etc),
     // and a route-less resume fails prompt assembly (observed: notification
@@ -896,7 +908,7 @@ export async function deliverRestartNotice(ctx: any, cfg: Config, info: RestartC
     const resumed = await agents.resume({
       resumeSessionId: sessionId,
       ...(agentOptions !== undefined ? { agentOptions } : {}),
-      ...(setup !== undefined ? { setup } : {}),
+      ...(compose.setup !== undefined ? { setup: compose.setup } : {}),
     })
     agent = resumed.agent
     handle = resumed
@@ -932,10 +944,10 @@ export async function deliverRestartNotice(ctx: any, cfg: Config, info: RestartC
  * persistence may still be loading). Best-effort - failures are logged,
  * never thrown: a notice must not interfere with the freshly-booted process. */
 function scheduleRestartNotice(ctx: any, cfg: Config, info: RestartConfirmation): void {
-  const MAX_ATTEMPTS = 3
+  const MAX_ATTEMPTS = 5
   let attempts = 0
   const retry = (): void => {
-    const timer = setTimeout(attempt, 10_000)
+    const timer = setTimeout(attempt, 15_000)
     timer.unref?.()
   }
   const attempt = (): void => {
