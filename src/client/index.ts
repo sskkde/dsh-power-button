@@ -79,6 +79,77 @@ let operationId = 0
  * hundreds of milliseconds — the POST is still in flight and the page is
  * alive; the full-screen overlay only appears once the connection is about to
  * actually drop. */
+/** Shared recovery poll for a restart already in motion. Drives phase
+ * waiting -> recovering -> window.location.reload(): each round probes
+ * /health; success is authoritative when the instanceId changes from the
+ * caller's baseline (old A -> new B), with seenDown-then-up as the fallback
+ * only when NO baseline could be captured. Callers own the operation id
+ * (`active`) and have already set the initial overlay phase. */
+function pollRestartRecovery(baseline: string | null, active: () => boolean): void {
+  // Serial (single-flight) polling: each round awaits the fetch before the
+  // next timer is scheduled, so overlapping polls cannot race the state.
+  let seenDown = false
+  let upTicks = 0
+  let attempts = 0
+  const POLL_MS = 1000
+  const MAX_ATTEMPTS = 90
+
+  const poll = async (): Promise<void> => {
+    if (!active()) return
+    attempts += 1
+    if (attempts > MAX_ATTEMPTS) {
+      phase = 'error'
+      errorMsg = tl('restartTimeout')
+      emit()
+      return
+    }
+    let up = false
+    let instanceChanged = false
+    try {
+      const r = await fetch('/api/dsh-power-button/health', { cache: 'no-store' })
+      up = r.ok
+      if (r.ok) {
+        const j = await r.json().catch(() => ({})) as { instanceId?: string }
+        instanceChanged = baseline !== null
+          && typeof j.instanceId === 'string'
+          && j.instanceId !== baseline
+      }
+    } catch { up = false }
+    if (!active()) return
+
+    if (!up) {
+      seenDown = true
+      upTicks = 0
+      if (phase !== 'waiting') {
+        phase = 'waiting'
+        emit()
+      }
+    } else {
+      const confirmed = baseline !== null
+        ? instanceChanged // authoritative: a different process answered
+        : (seenDown && up) // fallback: real down followed by an up
+      if (confirmed) {
+        phase = 'recovering'
+        emit()
+        // Let the ring transition to 100% (1.1s) before reloading.
+        setTimeout(() => { if (active()) window.location.reload() }, 1300)
+        return
+      }
+      // Up without confirmation: allow ~20s for a POST to be delivered
+      // (it can queue behind the app's streams) before declaring failure.
+      upTicks += 1
+      if (upTicks >= 20) {
+        phase = 'error'
+        errorMsg = tl('restartNoEffect')
+        emit()
+        return
+      }
+    }
+    setTimeout(poll, POLL_MS)
+  }
+  void poll()
+}
+
 export function beginPower(next: PowerAction): void {
   const myOperation = ++operationId
   const active = (): boolean => myOperation === operationId
@@ -197,68 +268,9 @@ export function beginPower(next: PowerAction): void {
       })
       .catch(() => { /* polls observe the outage */ })
 
-    // Serial (single-flight) polling: each round awaits the fetch before the
-    // next timer is scheduled, so overlapping polls cannot race the state.
-    let seenDown = false
-    let upTicks = 0
-    let attempts = 0
-    const POLL_MS = 1000
-    const MAX_ATTEMPTS = 90
-
-    const poll = async (): Promise<void> => {
-      if (!active()) return
-      attempts += 1
-      if (attempts > MAX_ATTEMPTS) {
-        phase = 'error'
-        errorMsg = tl('restartTimeout')
-        emit()
-        return
-      }
-      let up = false
-      let instanceChanged = false
-      try {
-        const r = await fetch('/api/dsh-power-button/health', { cache: 'no-store' })
-        up = r.ok
-        if (r.ok) {
-          const j = await r.json().catch(() => ({})) as { instanceId?: string }
-          instanceChanged = baseline !== null
-            && typeof j.instanceId === 'string'
-            && j.instanceId !== baseline
-        }
-      } catch { up = false }
-      if (!active()) return
-
-      if (!up) {
-        seenDown = true
-        upTicks = 0
-        if (phase !== 'waiting') {
-          phase = 'waiting'
-          emit()
-        }
-      } else {
-        const confirmed = baseline !== null
-          ? instanceChanged // authoritative: a different process answered
-          : (seenDown && up) // fallback: real down followed by an up
-        if (confirmed) {
-          phase = 'recovering'
-          emit()
-          // Let the ring transition to 100% (1.1s) before reloading.
-          setTimeout(() => { if (active()) window.location.reload() }, 1300)
-          return
-        }
-        // Up without confirmation: allow ~20s for the POST to be delivered
-        // (it can queue behind the app's streams) before declaring failure.
-        upTicks += 1
-        if (upTicks >= 20) {
-          phase = 'error'
-          errorMsg = tl('restartNoEffect')
-          emit()
-          return
-        }
-      }
-      setTimeout(poll, POLL_MS)
-    }
-    void poll()
+    // Recovery poll (waiting -> recovering -> reload) is shared with the
+    // external-restart watcher: same health probe, same confirmation rule.
+    pollRestartRecovery(baseline, active)
   })()
 }
 
@@ -277,6 +289,81 @@ export function dismissPower(): void {
 export function onRestartChange(fn: () => void): () => void {
   listeners.add(fn)
   return () => { listeners.delete(fn) }
+}
+
+// ---------------------------------------------------------------------------
+// External-restart watcher (model tool / /restart command / other tab)
+// ---------------------------------------------------------------------------
+// beginPower() only runs for THIS page's power button: a restart triggered by
+// the model tool, a /restart command, another tab, or an external POST is
+// invisible to the page (the official connection layer auto-reconnects the
+// websocket but never reloads the document, so a stale client bundle keeps
+// running after a restart that was done precisely to update it). This
+// low-frequency watcher gives the page the same recovery the button flow has:
+// it probes /health every few seconds, and on evidence of an external
+// restart it drives the SAME waiting -> recovering -> reload overlay.
+
+/** Watch poll interval. A local loopback GET every 3.5s is negligible, and
+ * bounds the reaction latency to a model-triggered restart. */
+const WATCH_POLL_MS = 3500
+
+/**
+ * Watch for restarts triggered outside this page. Returns the interval
+ * handle (callers clear it on plugin teardown / hot reload).
+ *
+ * Decision rules, deliberately conservative (a false reload is far worse
+ * than a late one):
+ *  - `/health` unreachable: no decision - transient blip or mid-restart
+ *    window; the next successful probe decides.
+ *  - `lifecycle === 'restart'` (the old process is draining; its in-memory
+ *    powerTransition latch reports this): enter the waiting overlay once and
+ *    hand over to the shared recovery poll.
+ *  - instanceId differs from the established baseline: the new process is
+ *    already answering - go straight to recovering + reload. The baseline is
+ *    (re)established lazily on every probe until first seen, so a fresh page
+ *    load adopts whatever process answers without ever reloading for it.
+ * No action while any in-page power flow is active (phase !== 'idle').
+ */
+function watchExternalRestarts(): ReturnType<typeof setInterval> {
+  let baseline: string | null = null
+  let engaged = false
+  const probe = async (): Promise<void> => {
+    let j: { instanceId?: string, lifecycle?: string } | null = null
+    try {
+      const r = await fetch('/api/dsh-power-button/health', { cache: 'no-store' })
+      if (r.ok) j = await r.json().catch(() => null)
+    } catch { j = null }
+    if (j === null) return // unreachable: no decision (see rules above)
+    // Establish/refresh the baseline until first seen.
+    if (baseline === null && typeof j.instanceId === 'string') {
+      baseline = j.instanceId
+      return // first sighting is the baseline, never a change
+    }
+    if (typeof j.instanceId !== 'string') return
+    // (a) an external restart completed: a DIFFERENT process answered.
+    if (j.instanceId !== baseline) {
+      baseline = j.instanceId // adopt the new instance
+      if (phase !== 'idle') return // an in-page flow already owns the UI
+      action = 'restart'
+      errorMsg = null
+      const myOperation = ++operationId
+      phase = 'recovering'
+      emit()
+      setTimeout(() => { if (myOperation === operationId) window.location.reload() }, 1300)
+      return
+    }
+    // (b) an external restart is in progress (old process draining).
+    if (j.lifecycle === 'restart' && phase === 'idle' && !engaged) {
+      engaged = true // one overlay per page lifetime: no re-engage nagging
+      action = 'restart'
+      errorMsg = null
+      const myOperation = ++operationId
+      phase = 'waiting'
+      emit()
+      pollRestartRecovery(baseline, () => myOperation === operationId)
+    }
+  }
+  return setInterval(() => { void probe() }, WATCH_POLL_MS)
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +409,14 @@ const SHUTDOWN_CONFIRM_PENDING = 'SHUTDOWN_CONFIRM_PENDING'
 export function apply(ctx: ClientContext): void {
   // Register UI strings so the button/overlay follow the DSH interface language.
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-power-button: dictionaries')
+
+  // Background watcher: reload the page after a restart triggered OUTSIDE it
+  // (model tool / /restart command / another tab / external POST). Effect-
+  // scoped so a plugin hot reload or teardown clears the interval.
+  ctx.effect(() => {
+    const timer = watchExternalRestarts()
+    return () => clearInterval(timer)
+  }, 'dsh-power-button: external restart watcher')
 
   // Capture the locale service for module-scope (non-component) error strings.
   localeSvc = ctx.locale

@@ -11,17 +11,50 @@ interface Config {
   enableModelTool: boolean;
   /** Upper bound (ms) for the model tool's delayMs argument. */
   maxDelayMs: number;
+  /** After a restart that was triggered from inside a session (model tool or
+   * /restart command), notify that session on the new process. */
+  notifySession: boolean;
+  /** How the restart-complete notice reaches the session:
+   * - 'followup': queue a follow-up turn and wake the driver - the model sees
+   *   the notice immediately and can continue its interrupted work (costs one
+   *   model round).
+   * - 'inject': queue model-facing context WITHOUT waking the driver - the
+   *   notice is durable in the session inbox and is seen on the next wake
+   *   (zero model cost). */
+  notifyMode: 'followup' | 'inject';
+  /** Delay (ms) after boot before the restart-complete notice is delivered -
+   * gives the freshly-relaunched process time to finish loading services. */
+  notifyDelayMs: number;
 }
 /** Schemastery schema; cordis validates and provides it as apply(ctx, config). */
 declare const Config: z<Config>;
 /** Per-port marker path. Exported for tests (isolated via DSH_HOME). */
 declare function markerPath(): string;
+/** Set at apply time when this process is the freshly-restarted instance:
+ * health reports `restarted: true, fromInstanceId: <old>` so a /restart
+ * command, the model tool, or a UI click can be confirmed after the fact.
+ * `originSessionId`/`originSource` (when the restart was triggered from
+ * inside a session) drive the restart-complete notice. */
+interface RestartConfirmation {
+  fromInstanceId: string;
+  originSessionId?: string;
+  originSource?: string;
+  requestedAt?: string;
+}
+/** Where a restart request came from, captured at the trigger site so the
+ * new process can notify the originating session. */
+interface RestartOrigin {
+  /** The session that asked for the restart (the agent driving the model
+   * tool or /restart command), when triggered from inside a session. */
+  sessionId?: string;
+  /** Trigger site: 'tool' (restart_harness), 'command' (/restart),
+   * 'http' (power button / external POST). */
+  source: 'tool' | 'command' | 'http';
+}
 /** Record restart intent. Exported for tests (isolated via DSH_HOME). */
 declare function writeMarker(data: Record<string, unknown>): void;
 /** Whether THIS process is the freshly-restarted instance. Exported for tests. */
-declare function consumeRestartConfirmation(): {
-  fromInstanceId: string;
-} | null;
+declare function consumeRestartConfirmation(): RestartConfirmation | null;
 /**
  * Redact credential-shaped content from a command line before logging.
  * Handles both shapes:
@@ -44,6 +77,8 @@ declare function clampModelDelayMs(raw: number, maxDelayMs: number): number;
 /** Startup housekeeping: prune old restart-helper logs so ~/.dsh does not
  * accumulate one file per restart forever. Best-effort, never throws. */
 declare function pruneOldRestartLogs(maxAgeDays?: number): void;
+/** Render the notice text the session's model will see. */
+declare function renderRestartNoticeText(en: boolean, originSource?: string): string;
 declare function apply(ctx: any, config: Config): void;
 //#endregion
-export { Config, apply, clampModelDelayMs, consumeRestartConfirmation, inject, markerPath, name, pruneOldRestartLogs, redactCommandLine, writeMarker };
+export { Config, RestartOrigin, apply, clampModelDelayMs, consumeRestartConfirmation, inject, markerPath, name, pruneOldRestartLogs, redactCommandLine, renderRestartNoticeText, writeMarker };

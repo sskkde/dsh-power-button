@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest'
 import {
   consumeRestartConfirmation, writeMarker, markerPath,
   redactCommandLine, clampModelDelayMs, pruneOldRestartLogs,
+  renderRestartNoticeText,
 } from '../src/index.ts'
 
 describe('restart marker lifecycle', () => {
@@ -22,8 +23,34 @@ describe('restart marker lifecycle', () => {
     })
     expect(existsSync(markerPath())).toBe(true)
     const result = consumeRestartConfirmation()
-    expect(result).toEqual({ fromInstanceId: 'instance-A' })
+    // requestedAt now passes through too (the notice reports the restart
+    // timeline), so match on the identity-bearing fields instead of the
+    // exact object.
+    expect(result?.fromInstanceId).toBe('instance-A')
+    expect(result?.originSessionId).toBeUndefined()
     // Consumed: the file is gone, so a LATER ordinary boot cannot misreport.
+    expect(existsSync(markerPath())).toBe(false)
+  })
+
+  it('passes the origin session through the marker for the restart notice', () => {
+    // restartDsh records which session asked for the restart; the helper
+    // rewrites the marker on relaunch success preserving those fields; the
+    // new process must read them back to deliver the notice.
+    writeMarker({
+      fromInstanceId: 'instance-A',
+      requestedAt: '2026-01-01T00:00:00.000Z',
+      originSessionId: 'session-42',
+      originSource: 'tool',
+      newPid: process.pid,
+      relaunchedAt: new Date().toISOString(),
+    })
+    const result = consumeRestartConfirmation()
+    expect(result).toEqual({
+      fromInstanceId: 'instance-A',
+      originSessionId: 'session-42',
+      originSource: 'tool',
+      requestedAt: '2026-01-01T00:00:00.000Z',
+    })
     expect(existsSync(markerPath())).toBe(false)
   })
 
@@ -108,6 +135,17 @@ describe('redactCommandLine', () => {
   it('redacts bare secret-shaped tokens (no key prefix)', () => {
     const out = redactCommandLine(['dsh', 'sk-proj-1234567890abcdef'])
     expect(out).not.toContain('sk-proj-1234567890abcdef')
+  })
+})
+
+describe('renderRestartNoticeText', () => {
+  it('names the trigger source and the new pid in both languages', () => {
+    const en = renderRestartNoticeText(true, 'tool')
+    expect(en).toContain('restart_harness')
+    expect(en).toContain(`pid ${process.pid}`)
+    const zh = renderRestartNoticeText(false, 'command')
+    expect(zh).toContain('/restart')
+    expect(zh).toContain(`pid ${process.pid}`)
   })
 })
 

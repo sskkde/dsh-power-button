@@ -51,6 +51,7 @@ import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import z from '@deepseek-ai/schemastery'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 
 /** Plugin version, read from package.json so /health can report it. */
 const require = createRequire(import.meta.url)
@@ -68,6 +69,20 @@ export interface Config {
   enableModelTool: boolean
   /** Upper bound (ms) for the model tool's delayMs argument. */
   maxDelayMs: number
+  /** After a restart that was triggered from inside a session (model tool or
+   * /restart command), notify that session on the new process. */
+  notifySession: boolean
+  /** How the restart-complete notice reaches the session:
+   * - 'followup': queue a follow-up turn and wake the driver - the model sees
+   *   the notice immediately and can continue its interrupted work (costs one
+   *   model round).
+   * - 'inject': queue model-facing context WITHOUT waking the driver - the
+   *   notice is durable in the session inbox and is seen on the next wake
+   *   (zero model cost). */
+  notifyMode: 'followup' | 'inject'
+  /** Delay (ms) after boot before the restart-complete notice is delivered -
+   * gives the freshly-relaunched process time to finish loading services. */
+  notifyDelayMs: number
 }
 
 /** Schemastery schema; cordis validates and provides it as apply(ctx, config). */
@@ -79,6 +94,9 @@ export const Config: z<Config> = z.object({
   // value silently defeat the 1000ms floor (e.g. maxDelayMs: 200 → clamp
   // returns 200), so reject it at schema validation time.
   maxDelayMs: z.number().default(5000).min(1000),
+  notifySession: z.boolean().default(true),
+  notifyMode: z.union([z.const('followup'), z.const('inject')] as const).default('followup'),
+  notifyDelayMs: z.number().default(5000).min(0),
 })
 
 const BASE = '/api/dsh-power-button'
@@ -109,8 +127,46 @@ const INSTANCE_ID = randomUUID()
 
 /** Set at apply time when this process is the freshly-restarted instance:
  * health reports `restarted: true, fromInstanceId: <old>` so a /restart
- * command, the model tool, or a UI click can be confirmed after the fact. */
-let restartConfirmation: { fromInstanceId: string } | null = null
+ * command, the model tool, or a UI click can be confirmed after the fact.
+ * `originSessionId`/`originSource` (when the restart was triggered from
+ * inside a session) drive the restart-complete notice. */
+interface RestartConfirmation {
+  fromInstanceId: string
+  originSessionId?: string
+  originSource?: string
+  requestedAt?: string
+}
+let restartConfirmation: RestartConfirmation | null = null
+
+/** Where a restart request came from, captured at the trigger site so the
+ * new process can notify the originating session. */
+export interface RestartOrigin {
+  /** The session that asked for the restart (the agent driving the model
+   * tool or /restart command), when triggered from inside a session. */
+  sessionId?: string
+  /** Trigger site: 'tool' (restart_harness), 'command' (/restart),
+   * 'http' (power button / external POST). */
+  source: 'tool' | 'command' | 'http'
+}
+
+/** Capture the session a restart is being triggered from, when the trigger
+ * runs inside an agent driver (model tool execution or command handler).
+ * Uses `ctx.get('agents')` (optional service - no inject dependency) and the
+ * registry's currentInitiator(), the same attribution the goal tools rely
+ * on. Returns the origin with no sessionId when not inside a driver (UI
+ * button, external curl) - those paths get no session notice. */
+function captureOrigin(ctx: any, source: RestartOrigin['source']): RestartOrigin {
+  try {
+    const agents = ctx.get?.('agents') as
+      | { currentInitiator?: () => { id?: string } | undefined }
+      | undefined
+    const initiator = agents?.currentInitiator?.()
+    if (initiator !== undefined && typeof initiator.id === 'string' && initiator.id !== '') {
+      return { sessionId: initiator.id, source }
+    }
+  } catch { /* not inside an agent driver */ }
+  return { source }
+}
 
 /** Unique helper file + per-pid log so concurrent DSH instances (e.g. a
  * profile on :3080 and the test copy on :3081) cannot overwrite each other's
@@ -141,7 +197,7 @@ export function writeMarker(data: Record<string, unknown>): void {
 }
 
 /** Whether THIS process is the freshly-restarted instance. Exported for tests. */
-export function consumeRestartConfirmation(): { fromInstanceId: string } | null {
+export function consumeRestartConfirmation(): RestartConfirmation | null {
   const marker = readMarker()
   if (marker === null) return null
   const oldId = marker.fromInstanceId
@@ -163,7 +219,11 @@ export function consumeRestartConfirmation(): { fromInstanceId: string } | null 
   // restarted instance: B restarts from A, exits normally, then a manual C
   // boot must NOT report "restarted from A".
   try { fs.unlinkSync(markerPath()) } catch { /* ignore */ }
-  return { fromInstanceId: oldId }
+  const result: RestartConfirmation = { fromInstanceId: oldId }
+  if (typeof marker.originSessionId === 'string') result.originSessionId = marker.originSessionId
+  if (typeof marker.originSource === 'string') result.originSource = marker.originSource
+  if (typeof marker.requestedAt === 'string') result.requestedAt = marker.requestedAt
+  return result
 }
 
 /**
@@ -287,12 +347,20 @@ try {
  * Relaunch DSH. Returns immediately; the actual restart happens in a helper
  * that is fully detached from this process tree.
  */
-function restartDsh(ctx, delayMs = 1500) {
+function restartDsh(ctx, delayMs = 1500, origin: RestartOrigin = { source: 'http' }) {
   try {
     const port = resolvePort(ctx)
     // Record restart intent: the new process reads this to confirm it IS the
-    // restarted instance (its own instanceId differs from the recorded old).
-    writeMarker({ fromInstanceId: INSTANCE_ID, requestedAt: new Date().toISOString() })
+    // restarted instance (its own instanceId differs from the recorded old),
+    // and - when the restart was triggered from inside a session - which
+    // session to notify once the new process is up.
+    const requestedAt = new Date().toISOString()
+    writeMarker({
+      fromInstanceId: INSTANCE_ID,
+      requestedAt,
+      originSessionId: origin.sessionId,
+      originSource: origin.source,
+    })
     // Replay the CURRENT invocation, portably (no hard-coded paths):
     // execArgv carries node flags (e.g. --import tsx/esm), argv the entry
     // script + app args. Spawned children inherit env, so any NODE_OPTIONS
@@ -300,6 +368,9 @@ function restartDsh(ctx, delayMs = 1500) {
     const relaunch = JSON.stringify([process.execPath, ...process.execArgv, ...process.argv.slice(1)])
     const cwd = process.cwd()
     const serverLog = path.join(RUNTIME_DIR, 'dsh-web.log')
+    // Origin passthrough: the helper REWRITES the marker on relaunch success,
+    // so the session-notice fields must be re-embedded in the helper script
+    // (they would otherwise be lost exactly when the restart succeeds).
     const helperScript = `'use strict';
 const { spawn } = require('node:child_process');
 const net = require('node:net');
@@ -309,6 +380,9 @@ const cwd = ${JSON.stringify(cwd)};
 const PORT = ${port};
 const OLD_PID = ${process.pid};
 const OLD_INSTANCE = ${JSON.stringify(INSTANCE_ID)};
+const REQUESTED_AT = ${JSON.stringify(requestedAt)};
+const ORIGIN_SESSION = ${JSON.stringify(origin.sessionId ?? null)};
+const ORIGIN_SOURCE = ${JSON.stringify(origin.source)};
 const MARKER = ${JSON.stringify(markerPath())};
 const LOG = ${JSON.stringify(LOG_FILE)};
 const SERVER_LOG = ${JSON.stringify(serverLog)};
@@ -417,11 +491,14 @@ function sessionsQuiescent(maxWaitMs) {
       child.unref();
       log('spawned pid ' + child.pid + ' (attempt ' + attempt + ')');
       // Confirm the relaunch in the marker so the new process can prove it
-      // is the restarted instance.
+      // is the restarted instance. Origin fields pass through so the new
+      // process knows which session (if any) to notify.
       try {
         fs.writeFileSync(MARKER, JSON.stringify({
           fromInstanceId: OLD_INSTANCE,
-          requestedAt: new Date().toISOString(),
+          requestedAt: REQUESTED_AT,
+          originSessionId: ORIGIN_SESSION,
+          originSource: ORIGIN_SOURCE,
           newPid: child.pid,
           relaunchedAt: new Date().toISOString(),
         }), 'utf8');
@@ -622,6 +699,176 @@ function isEnglishLocale(ctx): boolean {
   return false
 }
 
+// ---------------------------------------------------------------------------
+// Restart-complete session notice
+// ---------------------------------------------------------------------------
+// When a restart is triggered from INSIDE a session (the restart_harness model
+// tool or the /restart command), the marker records that session. The
+// freshly-relaunched process then delivers a "restart complete" notice to it
+// through the OFFICIAL agent APIs (ctx.agents.resume + followup/inject - the
+// same path the goal-round driver and the web prompt endpoint use), never by
+// writing session files directly: the interrupted turn is repaired by the
+// session restore path (interruptedTurnClosers), and the notice itself is a
+// durable inbox event, so it survives even if this process dies mid-delivery.
+
+/** Structural type for the optional `agents` service (`@deepseek-ai/dsh-agent`).
+ * Kept local so this plugin stays standalone (no hard dependency). */
+interface AgentsServiceShape {
+  get(id: string): AgentShape | undefined
+  resume(options: {
+    resumeSessionId: string
+    agentOptions?: unknown
+    setup?: (agentCtx: unknown) => Promise<void>
+  }): Promise<{ agent: AgentShape, dispose(): Promise<void> }>
+  currentInitiator?(): AgentShape | undefined
+}
+
+/** Structural type for a live Agent handle. */
+interface AgentShape {
+  id: string
+  followup(message: unknown): void
+  inject(message: unknown): void
+  whenIdle(): Promise<void>
+}
+
+/** Render the notice text the session's model will see. */
+export function renderRestartNoticeText(en: boolean, originSource?: string): string {
+  const trigger = en
+    ? { tool: 'the restart_harness tool', command: 'the /restart command', http: 'an HTTP request' }[originSource ?? 'http'] ?? 'a restart request'
+    : { tool: 'restart_harness 工具', command: '/restart 命令', http: 'HTTP 请求' }[originSource ?? 'http'] ?? '重启请求'
+  if (en) {
+    return `[dsh-power-button] DeepSeek Harness restart complete (triggered by ${trigger}). `
+      + `The new process is up (pid ${process.pid}); plugins and config that required a restart are now active. `
+      + `This notice is automatic - no user message preceded it. If you were mid-task when the restart happened, continue that work now.`
+  }
+  return `[dsh-power-button] DeepSeek Harness 重启完成（由${trigger}触发）。`
+    + `新进程已就绪（pid ${process.pid}），需要重启才能生效的插件与配置变更现已生效。`
+    + `本通知为自动发送，并非用户消息。若重启发生时你还有未完成的任务，请继续。`
+}
+
+/** Resolve the agent-preset setup for a resumed session, mirroring how the
+ * web host (dsh-host-apiproxy composeAgent) composes agents: resolve the
+ * preset recorded on the session header and mount it on the fresh agent
+ * context, so the notified model runs with its ORIGINAL toolset. Returns
+ * undefined when no preset is recorded or the services are absent - the
+ * host composition is the documented fallback then. */
+async function composePresetSetup(
+  ctx: any,
+  sessionId: string,
+): Promise<((agentCtx: unknown) => Promise<void>) | undefined> {
+  try {
+    const persistence = ctx.get?.('sessionPersistence') as
+      | { inspect?(id: string): Promise<{ meta?: { agentPreset?: string } }> }
+      | undefined
+    const presets = ctx.get?.('agentPresets') as
+      | { resolve?(id: string): Promise<{ id: string }>, mount?(agentCtx: unknown, id: string): Promise<void> }
+      | undefined
+    if (persistence === undefined || persistence.inspect === undefined) return undefined
+    if (presets === undefined || presets.resolve === undefined || presets.mount === undefined) {
+      return undefined
+    }
+    // Bind to locals: the guards above do not narrow across the closure below.
+    const inspect = persistence.inspect
+    const resolve = presets.resolve
+    const mount = presets.mount
+    const inspected = await inspect(sessionId)
+    const presetId = inspected?.meta?.agentPreset
+    if (typeof presetId !== 'string' || presetId === '') return undefined
+    const resolved = await resolve(presetId)
+    return async (agentCtx: unknown) => { await mount(agentCtx, resolved.id) }
+  } catch { /* no preset info -> compose nothing */ }
+  return undefined
+}
+
+/**
+ * Deliver the restart-complete notice to the session that requested the
+ * restart. Reuses the live agent when the web client already reconnected and
+ * resumed the session; otherwise resumes it from persistence (with its
+ * original agent preset mounted), delivers the notice, and disposes the
+ * handle after the notification turn settles. Returns false (retryable) when
+ * the agent services are not loaded yet; throws on permanent failures
+ * (unknown session, corrupt persistence).
+ */
+async function deliverRestartNotice(ctx: any, cfg: Config, info: RestartConfirmation): Promise<boolean> {
+  const sessionId = info.originSessionId as string
+  const agents = ctx.get?.('agents') as AgentsServiceShape | undefined
+  if (agents === undefined || typeof agents.resume !== 'function' || typeof agents.get !== 'function') {
+    return false // services still loading - caller retries
+  }
+  // Reuse the live agent when one exists (the web client may have resumed the
+  // session already); apiproxy resolves opens the same way, so both paths
+  // interoperate without ownership conflicts.
+  let agent = agents.get(sessionId)
+  let handle: { dispose(): Promise<void> } | null = null
+  if (agent === undefined) {
+    const setup = await composePresetSetup(ctx, sessionId)
+    const resumed = await agents.resume(
+      setup === undefined ? { resumeSessionId: sessionId } : { resumeSessionId: sessionId, setup },
+    )
+    agent = resumed.agent
+    handle = resumed
+  }
+  const message = createUserMessage({
+    content: [{ type: 'text', text: renderRestartNoticeText(isEnglishLocale(ctx), info.originSource) }],
+    source: { kind: 'plugin', plugin: 'dsh-power-button' },
+  })
+  if (cfg.notifyMode === 'inject') {
+    // Durable no-wake context: visible on the session's next wake, zero cost.
+    agent.inject(message)
+    if (handle !== null) await handle.dispose().catch(() => { /* best-effort */ })
+    return true
+  }
+  // followup: wake the driver for one notification turn so the model can
+  // continue its interrupted work immediately.
+  agent.followup(message)
+  if (handle !== null) {
+    // Let the notification turn settle before releasing the handle; bounded
+    // (5min) so a stuck LLM call cannot pin this plugin's boot path forever.
+    const settled = Promise.race([
+      agent.whenIdle().catch(() => { /* driver failure still settles */ }),
+      new Promise<void>((resolve) => { setTimeout(resolve, 300_000).unref?.() }),
+    ])
+    await settled
+    await handle.dispose().catch(() => { /* best-effort */ })
+  }
+  return true
+}
+
+/** Schedule the restart-complete notice: one delivery after notifyDelayMs,
+ * retried a bounded number of times (early boot races - the agent factory or
+ * persistence may still be loading). Best-effort - failures are logged,
+ * never thrown: a notice must not interfere with the freshly-booted process. */
+function scheduleRestartNotice(ctx: any, cfg: Config, info: RestartConfirmation): void {
+  const MAX_ATTEMPTS = 3
+  let attempts = 0
+  const retry = (): void => {
+    const timer = setTimeout(attempt, 10_000)
+    timer.unref?.()
+  }
+  const attempt = (): void => {
+    attempts += 1
+    deliverRestartNotice(ctx, cfg, info)
+      .then((delivered) => {
+        if (delivered) {
+          appendLog(LOG_FILE, `${new Date().toISOString()} restart notice delivered to session=${info.originSessionId} mode=${cfg.notifyMode}\n`)
+        } else if (attempts >= MAX_ATTEMPTS) {
+          appendLog(LOG_FILE, `${new Date().toISOString()} restart notice skipped: agent services unavailable after ${attempts} attempts (session=${info.originSessionId})\n`)
+        } else {
+          retry()
+        }
+      })
+      .catch((error) => {
+        // Unknown session / corrupt persistence / rejected resume: retry a
+        // bounded number of times (an early-boot service race can look like
+        // this too), then give up. Never fatal.
+        appendLog(LOG_FILE, `${new Date().toISOString()} restart notice failed (session=${info.originSessionId} attempt=${attempts}): ${String(error)}\n`)
+        if (attempts < MAX_ATTEMPTS) retry()
+      })
+  }
+  const first = setTimeout(attempt, Math.max(0, cfg.notifyDelayMs))
+  first.unref?.()
+}
+
 export function apply(ctx, config: Config) {
   // Startup housekeeping: prune stale restart-helper logs from previous runs.
   pruneOldRestartLogs()
@@ -639,6 +886,17 @@ export function apply(ctx, config: Config) {
     // when /health reports `restarted: true` (see src/client/RestartNotice.tsx).
     // Nothing is written into any session log, so a restart can never corrupt
     // a session file or trip the token-meter step-pairing invariant.
+    //
+    // Session notice (the ONLY session write, via the official agent APIs):
+    // when the restart was triggered from inside a session, deliver a
+    // "restart complete" followup/inject to it once this process is settled.
+    if (
+      config.notifySession
+      && typeof restartConfirmation.originSessionId === 'string'
+      && restartConfirmation.originSessionId !== ''
+    ) {
+      scheduleRestartNotice(ctx, config, restartConfirmation)
+    }
   }
 
   ctx.effect(() => ctx.webServer.register({
@@ -752,7 +1010,10 @@ export function apply(ctx, config: Config) {
           if (!claimPowerTransition('restart')) {
             return { ok: false, error: `power transition already in progress: ${powerTransition}` }
           }
-          const result = restartDsh(ctx, clamped)
+          // Capture the calling session BEFORE the restart: the new process
+          // notifies it once it is up (config.notifySession).
+          const origin = captureOrigin(ctx, 'tool')
+          const result = restartDsh(ctx, clamped, origin)
           if (!result.ok) releasePowerTransition()
           return result
         },
@@ -788,7 +1049,11 @@ export function apply(ctx, config: Config) {
           if (!claimPowerTransition('restart')) {
             return { kind: 'error', text: `power transition already in progress: ${powerTransition}` }
           }
-          const result = restartDsh(ctx)
+          // /restart typed by the model mid-turn runs inside its agent driver:
+          // capture that session so the new process can notify it. A command
+          // issued outside any driver (bare command bar) captures no session.
+          const origin = captureOrigin(ctx, 'command')
+          const result = restartDsh(ctx, 1500, origin)
           if (!result.ok) releasePowerTransition()
           return result.ok
             ? { kind: 'success', text: result.note }
