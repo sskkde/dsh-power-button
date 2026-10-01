@@ -19,6 +19,18 @@ export const zh = {
   shutdownConfirmBody: '关机后 DeepSeek Harness 将停止运行，需要你手动重新启动。',
   confirmShutdown: '关机',
   cancel: '取消',
+  // busy-restart confirm dialog (another session is running — restart would
+  // cut its task; the user must explicitly confirm a forced restart)
+  busyConfirmTitle: '会话正在运行',
+  // {0}-prefixed sentence that opens the body; the session list follows below.
+  busyConfirmBody: '以下会话仍在运行，重启会中断它们的任务。确定仍要重启吗？',
+  // Model-triggered variant of the same dialog: the model asked to restart
+  // Harness while sessions are running; the host suspended the request and the
+  // user's confirm/cancel is what authorizes (or blocks) the actual restart.
+  busyConfirmModelTitle: '模型请求重启',
+  busyConfirmModelBody: '模型请求重启 DeepSeek Harness。以下会话正在运行，重启会中断它们。是否允许重启？',
+  restartAnyway: '仍要重启',
+  busyMore: '还有 {0} 个',
   // overlay — restart
   restartDialog: '重启 DeepSeek Harness',
   restartClosing: '正在关闭 DeepSeek Harness…',
@@ -65,6 +77,18 @@ export const en = {
   shutdownConfirmBody: 'After shutdown the process stops and you must start it manually.',
   confirmShutdown: 'Shut down',
   cancel: 'Cancel',
+  // busy-restart confirm dialog (another session is running — restart would
+  // cut its task; the user must explicitly confirm a forced restart)
+  busyConfirmTitle: 'Sessions are running',
+  // {0}-prefixed sentence that opens the body; the session list follows below.
+  busyConfirmBody: 'The following sessions are still running — restarting would interrupt their tasks. Restart anyway?',
+  // Model-triggered variant of the same dialog: the model asked to restart
+  // Harness while sessions are running; the host suspended the request and the
+  // user's confirm/cancel is what authorizes (or blocks) the actual restart.
+  busyConfirmModelTitle: 'Restart requested by the model',
+  busyConfirmModelBody: 'The model requested a restart of DeepSeek Harness. The following sessions are still running, and a restart would interrupt them. Allow the restart?',
+  restartAnyway: 'Restart anyway',
+  busyMore: '+{0} more',
   // overlay — restart
   restartDialog: 'Restart DeepSeek Harness',
   restartClosing: 'Shutting down DeepSeek Harness…',

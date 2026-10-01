@@ -56,6 +56,8 @@ The plugin is configured through the profile's cordis layer (`cordis.patch.yml` 
 |---|---|---|
 | `enableModelTool` | `true` | Register the `restart_harness` model tool. Set `false` to keep restart exclusively on the GUI button and `/restart`. |
 | `maxDelayMs` | `5000` | Upper bound (ms) for the model tool's `delayMs` argument. The effective floor is 1000 ms. |
+| `busyGuard` | `true` | Before a restart, check whether any other session is currently running and, if so, require an explicit user confirmation in the GUI before proceeding (see [Busy restart guard](#busy-restart-guard)). |
+| `busyConfirmTimeoutMs` | `180000` | While another session is running, how long (ms) the `restart_harness` model tool / `/restart` command keeps waiting for the user to confirm or cancel the restart in the GUI before timing out (minimum 30000). |
 
 Example:
 
@@ -114,6 +116,45 @@ Mechanics:
   so a later refresh does not re-show it.
 - Because the confirmation never touches a session file, a restart can no
   longer corrupt session logs or leave unpaired events behind.
+
+## Busy restart guard
+
+A restart ends the whole process mid-flight: any **other** session that is
+running at that moment gets its task cut off (the agent's turn dies with the
+process; only the restart-requesting session receives the restart-complete
+notice afterwards). Because a running task can lose real progress, the plugin
+refuses to restart while other sessions are running — unless the user
+explicitly confirms it.
+
+Truth source: the AgentRegistry (`ctx.get('agents')`), the same registry the
+GUI's per-session running indicator uses — a session counts as busy when its
+agent `status` is `'running'`. The session that ASKED for the restart (if any)
+is excluded: restarting your own session is the point of the button.
+
+Behavior on each trigger path:
+
+- **GUI / HTTP** — a restart while another session is running returns
+  `409 blocked: 'busy'` with the offending session ids; the browser then pops
+  a confirm dialog listing them. **Restart anyway** re-issues the restart with
+  `{ force: true }` (the only request that can pass the guard); **Cancel**
+  dismisses and the flow returns to idle.
+- **`restart_harness` model tool** — instead of returning a hard block, the
+  tool call **suspends and waits**: the host records a pending restart and
+  exposes it on `/health` (`pendingConfirm`), and the GUI pops the same busy
+  confirm dialog in its "model request" mode. **Confirm** tells the host to
+  proceed (the suspended tool call then performs the restart); **Cancel** (or
+  the confirm timing out after `busyConfirmTimeoutMs`) resolves the wait and
+  the tool returns a `blocked: 'busy'` cancellation. The model itself is never
+  able to pass `force`: the forced-restart bypass is reserved for trusted
+  loopback HTTP callers (normally the GUI's confirm click), never for
+  in-process model code.
+- **`/restart` command** — behaves like the model tool: while another session
+  is running it suspends and waits for the GUI confirmation; on confirm it
+  restarts, on cancel/timeout it returns a readable "restart cancelled"
+  error describing which sessions were running and why.
+
+Set `busyGuard: false` to skip the check entirely (restart proceeds as before,
+with no confirmation).
 
 ## Development
 

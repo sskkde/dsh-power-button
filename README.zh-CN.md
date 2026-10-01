@@ -56,6 +56,8 @@ dsh plugin --profile web add "github:keyiadiannao/dsh-power-button#master"
 |---|---|---|
 | `enableModelTool` | `true` | 注册 `restart_harness` 模型工具。设 `false` 则重启仅保留在 GUI 按钮与 `/restart`。 |
 | `maxDelayMs` | `5000` | 模型工具 `delayMs` 参数的上限(ms)。有效下限为 1000 ms。 |
+| `busyGuard` | `true` | 重启前检查是否有其他会话正在运行;若有,必须先在 GUI 中经人工确认才能重启(见[忙碌重启护栏](#忙碌重启护栏))。 |
+| `busyConfirmTimeoutMs` | `180000` | 有其他会话运行时,`restart_harness` 模型工具 / `/restart` 命令等待用户在 GUI 中确认或取消重启的最长时间(ms),超时即取消(最小 30000)。 |
 
 示例:
 
@@ -107,6 +109,36 @@ toast。这是**纯 UI 提示**:不会向任何会话日志写入内容。(此�
 - 客户端加载后查询一次 `/health`;若 `restarted` 为真则显示 toast,然后通过
   `POST /api/dsh-power-button/notice-shown` 确认,避免刷新后重复弹出
 - 由于确认消息完全不触碰会话文件,重启**不再可能损坏会话日志**或留下未配对事件
+
+## 忙碌重启护栏
+
+重启会终结整个进程:此刻**其他**正在运行的会话会当场被打断(它们的
+agent turn 随进程一起终止;只有发起重启的那个会话事后会收到重启完成
+通知)。由于运行中的任务可能丢失真实进度,插件在其他会话运行期间会拒绝
+重启——除非用户显式确认。
+
+判忙真源:AgentRegistry(`ctx.get('agents')`),与 GUI 中每个会话的
+"运行中"指示同源——`status === 'running'` 即视为忙碌。发起重启的会话
+(如果有)被排除:重启自己的会话正是按钮的用途。
+
+各触发路径的行为:
+
+- **GUI / HTTP**——其他会话运行中时重启返回 `409 blocked: 'busy'` 与
+  冲突会话 id;浏览器随即弹出确认弹窗列出它们。「仍要重启」以
+  `{ force: true }` 重新发起(唯一能通过护栏的请求);「取消」关闭弹窗,
+  流程回到 idle。
+- **`restart_harness` 模型工具**——不再直接拒绝,而是**挂起等待**:宿主
+  记录一个待确认的重启请求,并在 `/health` 上暴露(`pendingConfirm`),GUI
+  随即弹出同一个忙碌确认弹窗("模型请求重启"模式)。「允许」告知宿主放行
+  (挂起的工具调用随后真正执行重启);「取消」或超过
+  `busyConfirmTimeoutMs` 超时则结束等待,工具返回 `blocked: 'busy'`
+  取消结果。模型自身永远无法传 `force`:强制重启的绕过通道只保留给受信的
+  本机 HTTP 调用方(通常是 GUI 里的确认点击),进程内的模型代码永远不可用。
+- **`/restart` 命令**——与模型工具一致:其他会话运行中时挂起等待 GUI
+  确认;确认后重启,取消/超时则返回可读的 "restart cancelled" 错误,
+  说明哪些会话在运行及原因。
+
+设 `busyGuard: false` 可完全跳过检查(重启与之前一样,不再确认)。
 
 ## 开发
 

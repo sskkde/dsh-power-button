@@ -16,6 +16,7 @@ import { RestartNotice } from './RestartNotice.tsx'
 import { RestartOverlay } from './RestartOverlay.tsx'
 import { RestartPreparing } from './RestartPreparing.tsx'
 import { ShutdownConfirmDialog } from './ShutdownConfirmDialog.tsx'
+import { RestartBusyConfirm } from './RestartBusyConfirm.tsx'
 import { en, zh } from './locales.ts'
 
 /** Required services. */
@@ -28,6 +29,41 @@ export const NS = 'power.button'
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
     'power.button': keyof typeof zh
+  }
+  /**
+   * Host-declared slot seats this plugin registers into. Official DSH client
+   * packages (dsh-client-ui-sidebar / dsh-client-ui-layout) declare them; we
+   * redeclare here so this standalone repo typechecks against the published
+   * (empty-SlotMap) client packages — mirroring the sidebars' contracts.
+   */
+  interface SlotMap {
+    'sidebar.footer.action': {
+      kind: 'list'
+      scope: 'root'
+      owner: { wide: boolean }
+    }
+    'shell.overlay': {
+      kind: 'list'
+      scope: 'root'
+    }
+  }
+}
+/**
+ * Minimal host-side additions used by this plugin, declared against the
+ * Cordis client context (the official runtime supplies both at boot):
+ *  - `ctx.locale` — dictionary registration + active-locale snapshot;
+ *  - `command/executed` — host-emitted command outcome bridge (the
+ *    /shutdown confirm flow listens on it).
+ */
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    locale: {
+      register(ns: string, dictionaries: { zh: Record<string, string>; en: Record<string, string> }): () => void
+      snapshot: { active: string }
+    }
+  }
+  interface Events {
+    'command/executed'(sessionId: string, name: string, result: unknown): void
   }
 }
 
@@ -150,9 +186,10 @@ function pollRestartRecovery(baseline: string | null, active: () => boolean): vo
   void poll()
 }
 
-export function beginPower(next: PowerAction): void {
+export function beginPower(next: PowerAction, opts?: { force?: boolean }): void {
   const myOperation = ++operationId
   const active = (): boolean => myOperation === operationId
+  const force = opts?.force === true
   action = next
   errorMsg = null
 
@@ -257,19 +294,60 @@ export function beginPower(next: PowerAction): void {
 
     if (!active()) return
 
-    // Fire the restart POST now that the baseline is captured.
-    void fetch('/api/dsh-power-button/restart', { method: 'POST', keepalive: true })
-      .then(async (r) => {
-        const j = await r.json().catch(() => ({}))
-        if (!active()) return
-        if (!r.ok || (j as { ok?: boolean })?.ok === false) {
-          fail((j as { error?: string })?.error ?? tl('opFailedHttp').replace('{0}', String(r.status)))
-        }
+    // Fire the restart POST now that the baseline is captured, and AWAIT its
+    // response. The pre-busy-guard flow fired-and-forgot and started the
+    // recovery poll immediately; the busy guard changes that: a
+    // `blocked: 'busy'` 409 must cancel THIS flow and ask the user for a
+    // forced restart BEFORE any recovery poll starts — a poll after a blocked
+    // restart would watch a live server for ~20s and misreport restartNoEffect
+    // for a restart that never happened. Only the FORCE call carries a body:
+    // the plain call stays a bare keepalive POST, exactly as before.
+    let busyBlocked = false
+    let busySessions: string[] = []
+    try {
+      const r = await fetch(endpoint, {
+        method: 'POST',
+        keepalive: true,
+        ...(force
+          ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify({ force: true }) }
+          : {}),
       })
-      .catch(() => { /* polls observe the outage */ })
+      const j = await r.json().catch(() => ({})) as { ok?: boolean; blocked?: string; busySessions?: unknown }
+      if (!active()) return
+      if (j.blocked === 'busy' && !force) {
+        // Host busy guard fired: another session is running. Cancel the whole
+        // in-page flow (operation bump invalidates every stale timer), then
+        // surface the GUI confirm dialog — the ONLY way to bypass the guard.
+        busyBlocked = true
+        busySessions = Array.isArray(j.busySessions)
+          ? j.busySessions.filter((s): s is string => typeof s === 'string')
+          : []
+      } else if (!r.ok || j.ok === false) {
+        // A DEFINITE server-side refusal (latch 409, internal 500, ...): the
+        // restart did not happen. Show the server's error and stop here — a
+        // recovery poll would watch a LIVE server for ~20s and then overwrite
+        // this message with a misleading restartNoEffect. (Only a transport
+        // failure below keeps polling: the restart may actually have been
+        // delivered even though the response was lost.)
+        fail((j as { error?: string })?.error ?? tl('opFailedHttp').replace('{0}', String(r.status)))
+        return
+      }
+    } catch { /* POST transport error — polls observe the outage */ }
+
+    if (!active()) return
+    if (busyBlocked) {
+      operationId += 1 // invalidate any stale timers from this flow
+      phase = 'idle'
+      errorMsg = null
+      emit()
+      requestBusyRestartConfirm(busySessions)
+      return
+    }
 
     // Recovery poll (waiting -> recovering -> reload) is shared with the
     // external-restart watcher: same health probe, same confirmation rule.
+    // Started only AFTER the POST response was processed, so a busy-blocked
+    // restart never reaches it.
     pollRestartRecovery(baseline, active)
   })()
 }
@@ -328,18 +406,49 @@ function watchExternalRestarts(): ReturnType<typeof setInterval> {
   let baseline: string | null = null
   let engaged = false
   const probe = async (): Promise<void> => {
-    let j: { instanceId?: string, lifecycle?: string } | null = null
+    let j: { instanceId?: string, lifecycle?: string, pendingConfirm?: { token?: unknown, busySessions?: unknown, source?: unknown, expiresAt?: unknown } } | null = null
     try {
       const r = await fetch('/api/dsh-power-button/health', { cache: 'no-store' })
       if (r.ok) j = await r.json().catch(() => null)
     } catch { j = null }
     if (j === null) return // unreachable: no decision (see rules above)
-    // Establish/refresh the baseline until first seen.
+    // Establish/refresh the baseline FIRST, before the pending branch: a tab
+    // whose every probe arrives during a pending confirm must still catch the
+    // post-restart instanceId change (the reload fallback once the decision
+    // resolved elsewhere). First sighting is the baseline, never a change.
     if (baseline === null && typeof j.instanceId === 'string') {
       baseline = j.instanceId
-      return // first sighting is the baseline, never a change
     }
     if (typeof j.instanceId !== 'string') return
+    // Pending-confirm surface channel: the host recorded a SUSPENDED
+    // model-triggered restart (another session is running; the tool/command is
+    // waiting). Pop the SAME busy confirm dialog, but in 'model' mode — the
+    // restart will be executed by the HOST once confirmed/cancelled, so no
+    // in-page recovery flow starts here. Ignores any active in-page flow
+    // (phase idle check mirrors the reload branches below).
+    const pc = j.pendingConfirm
+    if (pc && typeof pc.token === 'string') {
+      if (!isBusyRestartConfirmVisible() && phase === 'idle') {
+        requestModelRestartConfirm({
+          token: pc.token,
+          busySessions: Array.isArray(pc.busySessions)
+            ? pc.busySessions.filter((s): s is string => typeof s === 'string')
+            : [],
+        })
+      }
+      // While a pending confirm exists, the restart canonical decision is the
+      // confirm/cancel choice; the reload branches below must NOT also fire
+      // (a stale instance change must not double-act). Return after the
+      // pending-confirm branch so non-pending probes behave exactly as before.
+      return
+    }
+    // The pendingConfirm disappeared (another tab confirmed/cancelled, or the
+    // host timed it out): close a MODEL-mode dialog we opened. Pure close —
+    // the token is stale on the host, so no /cancel-pending POST (the real
+    // decision already happened elsewhere).
+    if (isBusyRestartConfirmVisible() && getBusyRestartSource() === 'model') {
+      cancelBusyRestartConfirm()
+    }
     // (a) an external restart completed: a DIFFERENT process answered.
     if (j.instanceId !== baseline) {
       baseline = j.instanceId // adopt the new instance
@@ -406,6 +515,141 @@ export function onShutdownConfirmChange(fn: () => void): () => void {
 /** Sentinel the host `/shutdown` handler returns to request the GUI dialog. */
 const SHUTDOWN_CONFIRM_PENDING = 'SHUTDOWN_CONFIRM_PENDING'
 
+// ---------------------------------------------------------------------------
+// Busy-restart confirm dialog (restart while other sessions are running)
+// ---------------------------------------------------------------------------
+// The host busy guard (config.busyGuard) refuses a restart with
+// `blocked: 'busy'` while another session is running. This page then cancels
+// its in-page flow and pops THIS dialog: the user explicitly confirms a
+// FORCED restart (beginPower('restart', { force: true })) or cancels. Only the
+// GUI can pass force — the model tool and /restart command never can. Same
+// store shape as the shutdown-confirm dialog above.
+//
+// The SAME dialog also serves MODEL-triggered restarts: the host does not
+// refuse those directly anymore — it records a pending confirmation and
+// suspends the tool/command execution until the user decides. The external-
+// restart watcher (watchExternalRestarts) observes the pending state on
+// /health (pendingConfirm field) and opens this dialog with the token; confirm
+// POSTs /confirm-pending, cancel POSTs /cancel-pending (best-effort), and the
+// host resolves the suspended wait accordingly. The restart itself still runs
+// on the host side (the suspended execution point), so `confirm` here never
+// calls beginPower for the model path.
+const busyConfirmListeners = new Set<() => void>()
+let busyConfirmVisible = false
+let busySessionIds: string[] = []
+/** Who opened the busy dialog: 'gui' (this page's power button hit the guard)
+ * or 'model' (the host suspended a model tool / /restart command, surfaced via
+ * /health pendingConfirm). Drives confirm/cancel behavior AND the dialog
+ * title/body. */
+let busyConfirmSource: 'gui' | 'model' = 'gui'
+/** Present only for source === 'model': the host pending token echoed back on
+ * confirm/cancel so the host can resolve the right suspended wait. */
+let busyConfirmToken: string | null = null
+
+function emitBusyConfirm(): void {
+  for (const fn of busyConfirmListeners) fn()
+}
+
+/** Show the busy-restart confirm dialog with the offending session ids.
+ * GUI semantics: opened by THIS page after its own POST got a blocked:'busy'
+ * 409; confirm re-runs the force flow (beginPower force). */
+export function requestBusyRestartConfirm(sessions: string[]): void {
+  busySessionIds = sessions
+  busyConfirmSource = 'gui'
+  busyConfirmToken = null
+  busyConfirmVisible = true
+  emitBusyConfirm()
+}
+
+/** Open the busy dialog for a MODEL-triggered suspended restart (surfaced via
+ * /health pendingConfirm by watchExternalRestarts). The dialog is identical;
+ * only confirm/cancel act differently (POST to the host's pending-resolution
+ * endpoints instead of beginPower force—the host executes the restart). */
+export function requestModelRestartConfirm(info: { token: string; busySessions: string[] }): void {
+  busySessionIds = info.busySessions
+  busyConfirmSource = 'model'
+  busyConfirmToken = info.token
+  busyConfirmVisible = true
+  emitBusyConfirm()
+}
+
+/** Dismiss the dialog without acting. For the model path the token becomes
+ * stale on the host (timeout / another tab resolved it) so this pure-close path
+ * never POSTs — callers that need to actively cancel use cancelPendingRestart(). */
+export function cancelBusyRestartConfirm(): void {
+  busyConfirmVisible = false
+  busyConfirmSource = 'gui'
+  busyConfirmToken = null
+  emitBusyConfirm()
+}
+
+/** Best-effort POST to /cancel-pending for a MODEL-triggered pending restart.
+ * Fire-and-forget: the host resolves the user's decision and the suspended
+ * tool/command gets the 'cancelled' outcome; a network failure is swallowed
+ * (the host timeout will release the wait anyway). */
+function cancelPendingRestart(token: string): void {
+  void fetch('/api/dsh-power-button/cancel-pending', {
+    method: 'POST',
+    keepalive: true,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token }),
+  }).catch(() => { /* best-effort: host timeout releases the wait */ })
+}
+
+/** Whether the busy-restart confirm dialog is currently shown. */
+export function isBusyRestartConfirmVisible(): boolean {
+  return busyConfirmVisible
+}
+
+/** The session ids the busy dialog was opened with. */
+export function getBusyRestartSessions(): string[] {
+  return busySessionIds
+}
+
+/** The source that opened the busy dialog ('gui' | 'model'). */
+export function getBusyRestartSource(): 'gui' | 'model' {
+  return busyConfirmSource
+}
+
+/** Subscribe to busy-dialog visibility changes. */
+export function onBusyRestartChange(fn: () => void): () => void {
+  busyConfirmListeners.add(fn)
+  return () => { busyConfirmListeners.delete(fn) }
+}
+
+/** User confirmed the restart in the busy dialog.
+ * - GUI path: re-enter the full restart flow with force — the POST carries
+ *   `{ force: true }`, the ONLY way past the host busy guard.
+ * - Model path: tell the host the user confirmed; the host's suspended
+ *   tool/command execution then runs the actual restart (at its single
+ *   execution point — the at-most-once latch and delayMs stay host-side).
+ *   No beginPower here: the restart happens on the host and the existing
+ *   external-restart watcher recovers the page (instanceId change → reload). */
+export function confirmBusyRestart(): void {
+  const token = busyConfirmToken
+  const source = busyConfirmSource
+  cancelBusyRestartConfirm()
+  if (source === 'model' && token !== null) {
+    void fetch('/api/dsh-power-button/confirm-pending', {
+      method: 'POST',
+      keepalive: true,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token }),
+    })
+      .then(async (r) => {
+        const j = await r.json().catch(() => ({})) as { ok?: boolean }
+        // Restart proceeds host-side; nothing more to do on success. A 404
+        // means the pending expired / another tab settled it — the host's
+        // suspended wait already resolved, so silently close.
+        if (r.ok && j.ok === true) return
+      })
+      .catch(() => { /* best-effort */ })
+    return
+  }
+  // GUI path (no model token): force-restart from this page.
+  beginPower('restart', { force: true })
+}
+
 export function apply(ctx: ClientContext): void {
   // Register UI strings so the button/overlay follow the DSH interface language.
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-power-button: dictionaries')
@@ -446,7 +690,7 @@ export function apply(ctx: ClientContext): void {
       id: 'dsh-power-button',
       order: -20,
       locale: NS,
-      label: (props) => props.t('power'),
+      label: () => (localeSvc?.snapshot.active === 'en' ? en.power : zh.power),
     }, RestartButton))
 
   // Full-screen restart/shutdown overlay (additive list slot; coexists with others).
@@ -494,4 +738,15 @@ export function apply(ctx: ClientContext): void {
       id: 'dsh-restart-shutdown-confirm',
       locale: NS,
     }, ShutdownConfirmDialog))
+
+  // Busy-restart confirm dialog: appears when the host busy guard refused a
+  // restart (blocked: 'busy') because another session is running. Confirm →
+  // beginPower('restart', { force: true }) re-runs the whole flow with the
+  // force bypass — the only path that can restart while sessions are busy.
+  ctx.slots.inject('shell.overlay', () =>
+    ctx.slots.register({
+      name: 'shell.overlay',
+      id: 'dsh-restart-busy-confirm',
+      locale: NS,
+    }, RestartBusyConfirm))
 }

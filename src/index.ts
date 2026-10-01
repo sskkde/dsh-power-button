@@ -83,6 +83,20 @@ export interface Config {
   /** Delay (ms) after boot before the restart-complete notice is delivered -
    * gives the freshly-relaunched process time to finish loading services. */
   notifyDelayMs: number
+  /** Busy guard: before a restart, check whether any OTHER session is running
+   * (agent status === 'running'). If so, the restart is blocked on the HTTP
+   * and tool/command paths until the user explicitly confirms it (force) — a
+   * restart would cut a running task's turn mid-flight, so at-restart (=after
+   * boot) behavior never depends on this flag: it gates the RESTART trigger. */
+  busyGuard: boolean
+  /** How long (ms) a MODEL-triggered restart waits for the user to confirm it
+   * in the GUI before the pending request times out. The busy guard turns the
+   * model tool / /restart command into a SUSPENDED wait ("pending restart"),
+   * surfaced to the GUI as a confirm dialog via /health; if the user neither
+   * confirms nor cancels within this window, the wait resolves to 'timeout'
+   * and the tool/command returns a timeout result. Floor of 30s so a misconfig
+   * cannot silently make model restarts hang for only a few seconds. */
+  busyConfirmTimeoutMs: number
 }
 
 /** Schemastery schema; cordis validates and provides it as apply(ctx, config). */
@@ -97,6 +111,13 @@ export const Config: z<Config> = z.object({
   notifySession: z.boolean().default(true),
   notifyMode: z.union([z.const('followup'), z.const('inject')] as const).default('followup'),
   notifyDelayMs: z.number().default(8000).min(0),
+  // Busy guard on by default: a restart while another session is running must
+  // be explicitly confirmed first (the only bypass is the force flag, which is
+  // reachable only from the GUI / an HTTP caller — never from the model).
+  busyGuard: z.boolean().default(true),
+  // Model-triggered restart confirmation wait: 3min default, never under 30s
+  // (see the config field comment above).
+  busyConfirmTimeoutMs: z.number().default(180000).min(30000),
 })
 
 const BASE = '/api/dsh-power-button'
@@ -166,6 +187,228 @@ function captureOrigin(ctx: any, source: RestartOrigin['source']): RestartOrigin
     }
   } catch { /* not inside an agent driver */ }
   return { source }
+}
+
+/**
+ * Ids of every CURRENTLY RUNNING session, except the caller's own session.
+ * The busy-guard truth source is the AgentRegistry (`ctx.get('agents')` — the
+ * same optional service `captureOrigin` reads, and the same registry the GUI's
+ * per-session running indicator derives from, so the two never disagree).
+ * `agents.list()` returns all live agents, each with `id` and a `status`
+ * getter ('idle' | 'running').
+ *
+ * Robust to the service being absent or malformed: never throws, returns []
+ * unless it can positively observe at least one running OTHER session. The
+ * `exceptId` is the ORIGINATING session (the model tool / /restart command runs
+ * inside it) — the caller restarting its own session is not "another session".
+ *
+ * NOTE on method binding: `agents.list()` is a REAL method that reads
+ * `this.store` (AgentRegistry extends Service, list() iterates its Map) — it
+ * MUST be invoked with the service as its receiver. A `const list =
+ * agents.list; list()` would lose `this`, throw inside the try, and return []
+ * from the catch below: the guard would silently never fire. Always call it
+ * as `agents.list()`.
+ */
+export function runningSessionIds(ctx: any, exceptId?: string): string[] {
+  try {
+    const agents = ctx.get?.('agents') as
+      | { list?: () => Array<{ id?: unknown; status?: unknown }> }
+      | undefined
+    if (agents === undefined || typeof agents.list !== 'function') return []
+    const out: string[] = []
+    // Keep the receiver: list() reads this.store on the real registry.
+    for (const agent of agents.list() ?? []) {
+      if (typeof agent?.id !== 'string' || agent.id === '') continue
+      if (agent.id === exceptId) continue
+      // status is a getter on the live agent handle ('idle' | 'running').
+      if (agent.status === 'running') out.push(agent.id)
+    }
+    return out
+  } catch { /* service unavailable or a bad shape — treat as not busy */ }
+  return []
+}
+
+/** Render the bilingual blocked-by-busy notice (mirrors renderRestartNoticeText).
+ * Tells the model / command caller which sessions are running and that the
+ * restart would interrupt their in-flight task, and how to proceed: either
+ * wait for them to finish and retry, or force the restart from the GUI power
+ * button — the trust model is: the model tool and commands can NEVER pass
+ * force; any trusted loopback HTTP caller (normally the GUI) can. */
+export function renderBusyBlockedText(en: boolean, ids: string[]): string {
+  const listed = ids.length > 0 ? ids.join(', ') : '-'
+  if (en) {
+    return `Restart blocked: other session(s) are running (${listed}). `
+      + `Restarting would interrupt their in-flight task. Wait for them to finish and retry, `
+      + `or confirm a forced restart in the GUI power button.`
+  }
+  return `重启被拦截：其他会话正在运行（${listed}）。`
+    + `重启会中断它们正在进行的任务。请等待其结束后重试，或在 GUI 电源按钮中确认强制重启。`
+}
+
+/** The outcome of a pending (suspended) restart request, resolved by the GUI
+ * (or by the timeout timer). */
+export type PendingOutcome = 'confirmed' | 'cancelled' | 'timeout'
+
+/** Render the bilingual result the MODEL sees after its suspended restart wait
+ * resolves to a timeout (the user never confirmed/cancelled within the window).
+ * Mirrors renderBusyBlockedText's voice; distinct so the model can tell a plain
+ * busy-block apart from a confirmation that lapsed. */
+export function renderPendingTimeoutText(en: boolean, ids: string[]): string {
+  const listed = ids.length > 0 ? ids.join(', ') : '-'
+  if (en) {
+    return `Restart cancelled: the confirmation timed out. The restart was paused because other session(s) are running (${listed}), `
+      + `and no-one confirmed it within the allowed time, so it did not happen. Wait for the sessions to finish and retry, `
+      + `or confirm the restart in the GUI power button.`
+  }
+  return `重启已取消：等待确认超时。由于其他会话正在运行（${listed}），重启被挂起等待确认，`
+    + `但在允许的时间内无人确认，因此未执行重启。请等待会话结束后重试，或在 GUI 电源按钮中确认重启。`
+}
+
+/** Render the bilingual result the model sees when the user explicitly CANCELS
+ * the pending restart in the GUI. */
+export function renderPendingCancelledText(en: boolean, ids: string[]): string {
+  const listed = ids.length > 0 ? ids.join(', ') : '-'
+  if (en) {
+    return `Restart cancelled: the user declined the restart confirmation. `
+      + `Other session(s) are running (${listed}) and the restart would interrupt them; `
+      + `the user chose not to proceed. Wait for the sessions to finish and retry if you still need to restart.`
+  }
+  return `重启已取消：用户拒绝了重启确认。`
+    + `其他会话正在运行（${listed}），重启会中断它们，因此用户选择不继续。`
+    + `请等待会话结束后，若仍需重启再重试。`
+}
+
+/**
+ * A suspended, user-pending restart request.
+ *
+ * The busy guard no longer DIRECTLY blocks a model tool / /restart command when
+ * another session is running: it records a PendingConfirm here (module-level,
+ * in-process, exported only to the plugin's own endpoints/tool/command), the
+ * /health probe makes the GUI show the SAME confirm dialog as the GUI-clicked
+ * busy flow, and the tool/command execution AWAITS (`waitPendingConfirm`) the
+ * user's decision — confirmed → the actual restart proceeds at the single
+ * execution point; cancelled/timeout → the caller gets a readable result.
+ *
+ * Only ONE pending request may exist at a time (a second `create` is refused —
+ * concurrent suspensions would let two callers each think they own the restart
+ * latch). The wait/resolve pair is one-shot: `resolvePendingConfirm` fires the
+ * bound promise at most once and `settled` guards against the confirm and
+ * timeout timers both arriving.
+ */
+export interface PendingConfirm {
+  /** Opaque one-time token; the GUI echoes it back to confirm/cancel. */
+  token: string
+  /** Which trigger created the pending request ('tool' | 'command'). */
+  origin: RestartOrigin
+  /** The sessions that were busy when the pending request was created. */
+  busySessions: string[]
+  /** Whether the trigger was a model tool or a /restart command. */
+  source: 'tool' | 'command'
+  /** Creation timestamp (ISO). */
+  createdAt: string
+  /** Absolute ISO time at which the wait self-resolves to 'timeout'. */
+  expiresAt: string
+  /** The suspended wait promise + resolver (bound at create, fired once by a
+   * successful resolve). `waitPendingConfirm` awaits this promise. */
+  resolve?: { promise: Promise<PendingOutcome>, resolve: (o: PendingOutcome) => void }
+  /** One-shot settle marker: prevents confirm/cancel/timeout racing double-fire. */
+  settled?: boolean
+}
+
+/** Global (in-process) pending confirmation; at most one at a time. */
+let pendingConfirm: PendingConfirm | null = null
+
+/** The auto-timeout timer for the CURRENT pending confirmation (cleared on any
+ * earlier settle so a resolved request never leaves a stray ticker). */
+let pendingTimer: ReturnType<typeof setTimeout> | null = null
+
+/** Create a PendingConfirm for a busy-bound model restart. Refuses (returns
+ * null) if one is already pending — a second concurrent suspension must not
+ * exist (each caller would otherwise race for the single restart latch).
+ * The timeout timer is stored (module-level, unref'd) so a resolve can clear it
+ * instead of leaving a stray ticker. */
+export function createPendingConfirm(
+  origin: RestartOrigin,
+  busySessions: string[],
+  timeoutMs: number,
+): PendingConfirm | null {
+  if (pendingConfirm !== null) return null
+  const now = Date.now()
+  // Bind the wait promise BEFORE publishing the pending slot: once
+  // `pendingConfirm = pending` is visible, a resolve can fire it at any time.
+  let fire: ((o: PendingOutcome) => void) | null = null
+  const promise = new Promise<PendingOutcome>((resolve) => { fire = resolve })
+  const pending: PendingConfirm = {
+    token: randomUUID(),
+    origin,
+    busySessions,
+    // `source` is a projection of the origin's trigger: a model tool or a
+    // command. `origin.source` is 'tool' | 'command' already.
+    source: origin.source === 'tool' ? 'tool' : 'command',
+    createdAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + timeoutMs).toISOString(),
+    // Resolver bound now; a later resolve fires it exactly once.
+    resolve: { promise, resolve: (o: PendingOutcome) => { fire?.(o) } },
+  }
+  pendingConfirm = pending
+  // Auto-timeout: resolve once to 'timeout' after the window. The timer is
+  // cleared on any earlier settle (clearPendingTimer). unref so a lone pending
+  // request never holds the process open.
+  const timer = setTimeout(() => { resolvePendingConfirm(pending.token, 'timeout') }, timeoutMs)
+  timer.unref?.()
+  pendingTimer = timer
+  return pending
+}
+
+function clearPendingTimer(): void {
+  if (pendingTimer !== null) {
+    clearTimeout(pendingTimer)
+    pendingTimer = null
+  }
+}
+
+/** Peek at the current pending confirmation, if any. /health uses this to
+ * surface the pending state to the GUI watcher. */
+export function peekPendingConfirm(): PendingConfirm | null {
+  return pendingConfirm
+}
+
+/** Resolve (settle) the pending confirmation, exactly once. Returns the
+ * resolved PendingConfirm, or null when the token does not match an active
+ * pending request (already settled, or never created). `settled` guards the
+ * confirm/cancel and timeout paths racing: only the FIRST settle wins; every
+ * later resolve returns null and leaves the global slot untouched. */
+export function resolvePendingConfirm(
+  token: string,
+  outcome: PendingOutcome,
+): PendingConfirm | null {
+  if (pendingConfirm === null || pendingConfirm.token !== token) return null
+  if (pendingConfirm.settled) return null
+  const pending = pendingConfirm
+  pending.settled = true
+  clearPendingTimer()
+  pendingConfirm = null
+  // Fire the bound wait promise exactly once. The resolver stays bound (no
+  // attempt to clear it): `settled` already prevents a double-fire, and a
+  // stale resolver is unreachable — the pending slot is null, so no new
+  // waitPendingConfirm(token) can bind to it.
+  pending.resolve?.resolve(outcome)
+  return pending
+}
+
+/** Wait (suspend) for the pending confirmation to be resolved. The tool /
+ * command execution calls this right after createPendingConfirm and does not
+ * return until the user confirms/cancels or the timeout fires. Resolves once:
+ * subsequent calls (and the resolve happen-before) resolve to the SAME outcome,
+ * but only if the token is still the active pending request. */
+export function waitPendingConfirm(token: string): Promise<PendingOutcome> {
+  if (pendingConfirm !== null && pendingConfirm.token === token && pendingConfirm.resolve) {
+    return pendingConfirm.resolve.promise
+  }
+  // No active matching pending request: if it was settled (or timed out) in
+  // between, the caller should not hang — return a settled 'cancelled' so the
+  // wait never blocks forever after settle.
+  return Promise.resolve('cancelled')
 }
 
 /** Unique helper file + per-pid log so concurrent DSH instances (e.g. a
@@ -281,7 +524,7 @@ export function consumeRestartConfirmation(): RestartConfirmation | null {
  * THIS port to free; a hardcoded 3080 breaks restart on any other port
  * (e.g. the test copy on 3081).
  */
-function resolvePort(ctx): number {
+function resolvePort(ctx: any): number {
   try {
     const bound = ctx.webServer?.server?.address?.()
     if (bound && typeof bound === 'object' && typeof bound.port === 'number' && bound.port > 0) {
@@ -297,9 +540,56 @@ function resolvePort(ctx): number {
   return 3080
 }
 
-function json(res, status, payload) {
+function json(res: any, status: number, payload: unknown) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
   res.end(JSON.stringify(payload))
+}
+
+/**
+ * Read a JSON request body, defensively. The HTTP endpoints historically take
+ * NO body (bare POSTs from curl / the classic power button), and must stay
+ * backwards compatible — so a body is only read when the framing says one is
+ * present (Content-Length > 0 or Transfer-Encoding: chunked), capped at 16KB,
+ * and any parse/read failure resolves to {} instead of throwing. This lets the
+ * restart handler opt into an optional `{ force: boolean }` body (the busy-guard
+ * bypass) without ever letting a malformed body crash the endpoint.
+ *
+ * Exported for tests (module-level symbol, never part of the public API).
+ */
+export function readJsonBody(req: any): object {
+  if (typeof req?.on !== 'function') return {}
+  const hasBody = typeof req.headers?.['content-length'] === 'string' && Number(req.headers['content-length']) > 0
+    || typeof req.headers?.['transfer-encoding'] === 'string'
+  if (!hasBody) return {}
+  return new Promise((resolve) => {
+    let chunks = ''
+    let tooBig = false
+    const MAX = 16 * 1024
+    req.on('data', (c: Buffer) => {
+      // Stop accumulating once over the cap — the body is still drained to
+      // 'end' (the connection must not stall), but no further bytes are kept.
+      if (tooBig) return
+      chunks += c.toString('utf8')
+      if (chunks.length > MAX) tooBig = true
+    })
+    // 'aborted' (client hung up) and 'error' both mean no usable body; either
+    // way the guard treats the request as unforced.
+    req.on('end', () => {
+      if (tooBig) return resolve({})
+      try {
+        const parsed = JSON.parse(chunks)
+        if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) return resolve(parsed as object)
+      } catch { /* bad body - ignore */ }
+      resolve({})
+    })
+    req.on('error', () => resolve({}))
+  })
+}
+
+/** Whether a candidate object carries a truthy `force` flag (busy-guard bypass).
+ * Exported for tests (module-level symbol, never part of the public API). */
+export function wantsForce(body: object): boolean {
+  return (body as { force?: unknown })?.force === true
 }
 
 /** Append to a log file, rotating (truncating) once it exceeds 1MB so an
@@ -403,7 +693,7 @@ try {
  *    unit. The marker carries `supervisor: true` and the fresh intent; the
  *    new process claims the restart within a freshness window.
  */
-function restartDsh(ctx, delayMs = 1500, origin: RestartOrigin = { source: 'http' }) {
+function restartDsh(ctx: any, delayMs = 1500, origin: RestartOrigin = { source: 'http' }) {
   try {
     const port = resolvePort(ctx)
     const supervisor = supervisorManaged()
@@ -427,6 +717,11 @@ function restartDsh(ctx, delayMs = 1500, origin: RestartOrigin = { source: 'http
       try {
         appendLog(LOG_FILE, `${new Date().toISOString()} supervisor-managed restart requested (fromInstanceId=${INSTANCE_ID}); systemd will relaunch\n`)
       } catch { /* ignore */ }
+      // Total watchdog from the restart request: covers the ENTIRE exit chain
+      // (session flush + appExit dispose) so a hung dispose cannot strand this
+      // process alive with the port released while systemd waits for an exit
+      // that never comes (the observed restart-closure break).
+      armExitWatchdog(delayMs + EXIT_WATCHDOG_MS)
       scheduleExit(ctx, delayMs)
       return { ok: true, action: 'restart', note: isEnglishLocale(ctx) ? 'DeepSeek Harness is restarting' : 'DeepSeek Harness 正在重启' }
     }
@@ -596,7 +891,7 @@ function sessionsQuiescent(maxWaitMs) {
     scheduleExit(ctx, delayMs)
     return { ok: true, action: 'restart', note: isEnglishLocale(ctx) ? 'DeepSeek Harness is restarting' : 'DeepSeek Harness 正在重启' }
   } catch (e) {
-    return { ok: false, action: 'restart', error: e.message }
+    return { ok: false, action: 'restart', error: String(e) }
   }
 }
 
@@ -608,11 +903,29 @@ function sessionsQuiescent(maxWaitMs) {
  * this flush, is the durability authority. Then schedule the old process to
  * exit AFTER the HTTP response flushes. Prefer DSH's `ctx.appExit` (graceful
  * tree dispose); fall back to process.exit in non-standard embeddings. */
+/** Last-resort hard exit after a restart/shutdown is requested. The graceful
+ * `ctx.appExit` tree dispose is trusted to complete, but a hang has been
+ * observed: the web server releases its port while the process stays alive,
+ * so systemd `Restart=always` never fires and the restart intent marker goes
+ * stale — the supervisor restart never closes. A `.unref()`d watchdog keeps
+ * normal exits unchanged (nothing keeps the loop alive) while forcing the
+ * process out when the dispose hangs, letting the supervisor relaunch. */
+const EXIT_WATCHDOG_MS = 15_000
+function armExitWatchdog(ms: number = EXIT_WATCHDOG_MS): NodeJS.Timeout {
+  const t = setTimeout(() => {
+    try {
+      process.exit(0)
+    } catch { /* ignore */ }
+  }, ms)
+  if (typeof t.unref === 'function') t.unref()
+  return t
+}
 function scheduleExit(ctx: any, delayMs: number): void {
   const exit = (): void => {
     setTimeout(() => {
       const appExit = ctx.appExit
       if (typeof appExit === 'function') {
+        armExitWatchdog()
         appExit(0)
       } else {
         try { process.exit(0) } catch { /* ignore */ }
@@ -624,7 +937,7 @@ function scheduleExit(ctx: any, delayMs: number): void {
     if (live.length === 0) {
       exit()
     } else {
-      Promise.allSettled(live.map((session) => ctx.sessions.flush(session)))
+      Promise.allSettled(live.map((session: any) => ctx.sessions.flush(session)))
         .then(exit)
         .catch(exit)
     }
@@ -644,9 +957,10 @@ function scheduleExit(ctx: any, delayMs: number): void {
  * before the connection drops. Nothing relaunches — the user must start DSH
  * again manually.
  */
-function shutdownDsh(ctx, res) {
+function shutdownDsh(ctx: any, res: any) {
   try {
     const exitNow = (): void => {
+      armExitWatchdog()
       const appExit = ctx.appExit
       if (typeof appExit === 'function') {
         appExit(0)
@@ -663,7 +977,7 @@ function shutdownDsh(ctx, res) {
           exitNow()
           return
         }
-        Promise.allSettled(live.map((session) => ctx.sessions.flush(session)))
+        Promise.allSettled(live.map((session: any) => ctx.sessions.flush(session)))
           .then(exitNow)
           .catch(exitNow)
       } catch {
@@ -689,7 +1003,7 @@ function shutdownDsh(ctx, res) {
         : 'DeepSeek Harness 正在关机（进程停止后需手动重新启动）',
     }
   } catch (e) {
-    return { ok: false, action: 'shutdown', error: e.message }
+    return { ok: false, action: 'shutdown', error: String(e) }
   }
 }
 
@@ -716,7 +1030,7 @@ function shutdownDsh(ctx, res) {
  * requests never pass through the official fence automatically — this guard
  * is the only line of defense for them.
  */
-function isTrustedPowerRequest(req): boolean {
+function isTrustedPowerRequest(req: any): boolean {
   const address = req.socket?.remoteAddress
   if (address !== '127.0.0.1' && address !== '::1' && address !== '::ffff:127.0.0.1') return false
   const { host, origin, 'sec-fetch-site': secFetchSite } = req.headers
@@ -762,7 +1076,7 @@ function releasePowerTransition(): void {
 }
 
 /** Whether the UI language is English (DSH settings `locale.preference`). */
-function isEnglishLocale(ctx): boolean {
+function isEnglishLocale(ctx: any): boolean {
   try {
     const locale = ctx.settings?.get?.('locale') as { preference?: string } | undefined
     const pref = typeof locale?.preference === 'string' ? locale.preference.toLowerCase() : ''
@@ -974,7 +1288,7 @@ function scheduleRestartNotice(ctx: any, cfg: Config, info: RestartConfirmation)
   first.unref?.()
 }
 
-export function apply(ctx, config: Config) {
+export function apply(ctx: any, config: Config) {
   // Startup housekeeping: prune stale restart-helper logs from previous runs.
   pruneOldRestartLogs()
   // Resolve THIS instance's port first: markers are keyed by port so
@@ -1007,22 +1321,72 @@ export function apply(ctx, config: Config) {
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
     path: BASE,
-    handler: async (req, res) => {
+    handler: async (req: any, res: any) => {
       const url = new URL(req.url, 'http://x')
       const sub = url.pathname.slice(BASE.length).replace(/\/+$/, '') || '/'
       // Every mutation POST goes through the same-origin guard; health stays open.
-      const needsGuard = (sub === '/restart' || sub === '/shutdown' || sub === '/notice-shown') && req.method === 'POST'
+      const needsGuard = (sub === '/restart' || sub === '/shutdown' || sub === '/notice-shown'
+        || sub === '/confirm-pending' || sub === '/cancel-pending') && req.method === 'POST'
       if (needsGuard && !isTrustedPowerRequest(req)) {
         return json(res, 403, { ok: false, error: 'forbidden: cross-origin power request' })
       }
       try {
         if (sub === '/restart' && req.method === 'POST') {
+          // Optional JSON body (`{ force: true }`) from the GUI's confirmed
+          // busy-restart. Read it BEFORE claiming the transition so a busy
+          // block can't leave the at-most-once latch held for a retry.
+          const body = await readJsonBody(req)
+          const force = wantsForce(body)
+          // Busy guard: if another session is running and this call does NOT
+          // carry an explicit force flag, refuse with 409 WITHOUT claiming the
+          // latch (so a later retry — after the sessions finish, or a GUI
+          // force — can still proceed). Only the GUI / an HTTP caller can
+          // present { force: true }; the model tool never can.
+          if (cfg.busyGuard && !force) {
+            const busy = runningSessionIds(ctx)
+            if (busy.length > 0) {
+              return json(res, 409, {
+                ok: false, action: 'restart', blocked: 'busy', busySessions: busy,
+                error: renderBusyBlockedText(isEnglishLocale(ctx), busy),
+              })
+            }
+          }
           if (!claimPowerTransition('restart')) {
             return json(res, 409, { ok: false, error: `power transition already in progress: ${powerTransition}` })
           }
           const result = restartDsh(ctx)
           if (!result.ok) releasePowerTransition()
           return json(res, result.ok ? 200 : 500, result)
+        }
+        // Pending-restart resolution endpoints: the GUI echo-confirms/cancels a
+        // model-triggered suspended restart by token. These ONLY resolve the
+        // signal bridge — the actual restart is still executed by the suspended
+        // tool/command execution once it observes 'confirmed', so the
+        // at-most-once latch and delayMs semantics stay at the single execution
+        // point. An unknown/already-settled token is a 404 (the pending may
+        // have timed out or another tab resolved it — the GUI closes its
+        // dialog on that).
+        if (sub === '/confirm-pending' && req.method === 'POST') {
+          const body = await readJsonBody(req)
+          const token = (body as { token?: unknown }).token
+          const pending = typeof token === 'string'
+            ? resolvePendingConfirm(token, 'confirmed')
+            : null
+          if (pending === null) {
+            return json(res, 404, { ok: false, error: 'no pending restart for this token' })
+          }
+          return json(res, 200, { ok: true, token })
+        }
+        if (sub === '/cancel-pending' && req.method === 'POST') {
+          const body = await readJsonBody(req)
+          const token = (body as { token?: unknown }).token
+          const pending = typeof token === 'string'
+            ? resolvePendingConfirm(token, 'cancelled')
+            : null
+          if (pending === null) {
+            return json(res, 404, { ok: false, error: 'no pending restart for this token' })
+          }
+          return json(res, 200, { ok: true, token })
         }
         if (sub === '/shutdown' && req.method === 'POST') {
           if (!claimPowerTransition('shutdown')) {
@@ -1043,6 +1407,20 @@ export function apply(ctx, config: Config) {
             body.restarted = true
             body.fromInstanceId = restartConfirmation.fromInstanceId
           }
+          // Surface an active model-triggered pending restart: the GUI watcher
+          // (piggybacking on the existing health poll) pops the SAME busy
+          // confirm dialog when this is present, and echoes the token back to
+          // /confirm-pending or /cancel-pending. Omitted when nothing is
+          // pending (a plain /health stays byte-identical otherwise).
+          const pending = peekPendingConfirm()
+          if (pending !== null) {
+            body.pendingConfirm = {
+              token: pending.token,
+              source: pending.source,
+              busySessions: pending.busySessions,
+              expiresAt: pending.expiresAt,
+            }
+          }
           return json(res, 200, body)
         }
         if (sub === '/notice-shown' && req.method === 'POST') {
@@ -1056,7 +1434,7 @@ export function apply(ctx, config: Config) {
         json(res, 404, { ok: false, error: `no dsh-power-button endpoint ${sub}` })
       } catch (e) {
         releasePowerTransition()
-        json(res, 500, { ok: false, error: e.message })
+        json(res, 500, { ok: false, error: String(e) })
       }
     },
   }), 'dsh-power-button: http routes')
@@ -1101,25 +1479,66 @@ export function apply(ctx, config: Config) {
           // object/array/string/number/integer/boolean/null and would throw.
           // An empty schema (annotation-only) accepts any JSON value.
           schema: {},
-          render(_args, value) {
+          render(_args: any, value: any) {
             return [{ type: 'text', text: JSON.stringify(value, null, 2) }]
           },
         },
-        async execute(args) {
+        async execute(args: any) {
           const a = (args ?? {}) as { delayMs?: number }
           // Floor the model-visible delay: the restart tool must never be able
           // to kill the process before its own tool/result and turn boundary
           // settle. The delay is a process-control implementation detail; the
           // model only gets a bounded, floored knob.
           const clamped = clampModelDelayMs(Number(a.delayMs), cfg.maxDelayMs)
+          // Capture the calling session BEFORE the restart: the new process
+          // notifies it once it is up (config.notifySession).
+          const origin = captureOrigin(ctx, 'tool')
+          const en = isEnglishLocale(ctx)
+          // Busy guard: the model can NOT self-authorize a forced restart, so
+          // if another session is running, SUSPEND here — record the pending
+          // request (surfaced to the GUI as the same confirm dialog via
+          // /health) and WAIT for the user's explicit decision instead of
+          // refusing outright. The wait resolves exactly once (confirm /
+          // cancel / timeout); the caller's OWN session is excluded — whether
+          // this session is running is irrelevant, the model is asking it.
+          if (cfg.busyGuard) {
+            const busy = runningSessionIds(ctx, origin.sessionId)
+            if (busy.length > 0) {
+              const pending = createPendingConfirm(origin, busy, cfg.busyConfirmTimeoutMs)
+              if (pending === null) {
+                // A concurrent pending request already exists (another tool /
+                // command call is mid-wait, or a previous one is unsettled).
+                // Only one suspension at a time — refuse the second outright.
+                return {
+                  ok: false, action: 'restart', blocked: 'busy', busySessions: busy,
+                  error: en
+                    ? 'a restart is already awaiting user confirmation'
+                    : '已有待确认的重启请求',
+                }
+              }
+              const outcome = await waitPendingConfirm(pending.token)
+              if (outcome !== 'confirmed') {
+                // cancelled (user declined in the GUI) or timeout (nobody
+                // answered within busyConfirmTimeoutMs): the restart did NOT
+                // happen. Report the readable bilingual result.
+                return {
+                  ok: false, action: 'restart', blocked: 'busy', busySessions: busy,
+                  error: outcome === 'timeout'
+                    ? renderPendingTimeoutText(en, busy)
+                    : renderPendingCancelledText(en, busy),
+                }
+              }
+              // confirmed: the user explicitly authorized the restart in the
+              // GUI. Fall through to the regular flow — NO re-check of
+              // runningSessionIds (busy state may have changed in the wait
+              // window; the explicit confirmation IS the authorization).
+            }
+          }
           // Same at-most-once latch as the HTTP endpoints: the model tool and
           // a concurrent UI click must not spawn two helpers.
           if (!claimPowerTransition('restart')) {
             return { ok: false, error: `power transition already in progress: ${powerTransition}` }
           }
-          // Capture the calling session BEFORE the restart: the new process
-          // notifies it once it is up (config.notifySession).
-          const origin = captureOrigin(ctx, 'tool')
           const result = restartDsh(ctx, clamped, origin)
           if (!result.ok) releasePowerTransition()
           return result
@@ -1153,13 +1572,42 @@ export function apply(ctx, config: Config) {
           : '重启 DeepSeek Harness（重载插件与配置）',
         recordInput: false,
         async handler() {
-          if (!claimPowerTransition('restart')) {
-            return { kind: 'error', text: `power transition already in progress: ${powerTransition}` }
-          }
           // /restart typed by the model mid-turn runs inside its agent driver:
           // capture that session so the new process can notify it. A command
           // issued outside any driver (bare command bar) captures no session.
           const origin = captureOrigin(ctx, 'command')
+          const en = isEnglishLocale(ctx)
+          // Busy guard (same gate as the model tool): a command cannot force
+          // itself past a running OTHER session — the model driving this
+          // command cannot self-authorize a forced restart either. Instead of
+          // refusing outright it SUSPENDS: the request is surfaced to the GUI
+          // as the SAME busy confirm dialog (via /health pendingConfirm), and
+          // the handler waits for the user's decision.
+          if (cfg.busyGuard) {
+            const busy = runningSessionIds(ctx, origin.sessionId)
+            if (busy.length > 0) {
+              const pending = createPendingConfirm(origin, busy, cfg.busyConfirmTimeoutMs)
+              if (pending === null) {
+                return {
+                  kind: 'error',
+                  text: en
+                    ? 'a restart is already awaiting user confirmation'
+                    : '已有待确认的重启请求',
+                }
+              }
+              const outcome = await waitPendingConfirm(pending.token)
+              if (outcome !== 'confirmed') {
+                const text = outcome === 'timeout'
+                  ? renderPendingTimeoutText(en, busy)
+                  : renderPendingCancelledText(en, busy)
+                return { kind: 'error', text }
+              }
+              // confirmed: fall through to the regular latch + restart.
+            }
+          }
+          if (!claimPowerTransition('restart')) {
+            return { kind: 'error', text: `power transition already in progress: ${powerTransition}` }
+          }
           const result = restartDsh(ctx, 1500, origin)
           if (!result.ok) releasePowerTransition()
           return result.ok
