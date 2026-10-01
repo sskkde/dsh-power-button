@@ -53,6 +53,22 @@ import path from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 
+/**
+ * Producer-declared message source kind (session format v4).
+ * In v4 the generic `kind: 'plugin'` is rejected by the session-format
+ * admission check; every producer declares its own kind, conventionally
+ * `plugin:<name>` for third-party plugins (same shape the v3→v4 migration
+ * synthesizes for unknown plugin names).
+ */
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'plugin:dsh-power-button': {
+      kind: 'plugin:dsh-power-button'
+      plugin: string
+    }
+  }
+}
+
 /** Plugin version, read from package.json so /health can report it. */
 const require = createRequire(import.meta.url)
 const PLUGIN_VERSION = (require('../package.json') as { version?: string }).version ?? '0.0.0'
@@ -1143,28 +1159,42 @@ async function composePresetSetup(
   sessionId: string,
 ): Promise<{ setup?: (agentCtx: unknown) => Promise<void>, retryable?: boolean }> {
   try {
-    const persistence = ctx.get?.('sessionPersistence') as
-      | { inspect?(id: string): Promise<{ meta?: { agentPreset?: string } }> }
-      | undefined
     const presets = ctx.get?.('agentPresets') as
       | { resolve?(id: string): Promise<{ id: string }>, mount?(agentCtx: unknown, id: string): Promise<void> }
       | undefined
-    if (persistence === undefined || persistence.inspect === undefined) return { retryable: true }
     if (presets === undefined || presets.resolve === undefined || presets.mount === undefined) {
       return { retryable: true }
     }
-    // Bind to locals: the guards above do not narrow across the closure below.
-    const inspect = persistence.inspect
-    const resolve = presets.resolve
-    const mount = presets.mount
-    const inspected = await inspect(sessionId)
-    const presetId = inspected?.meta?.agentPreset
+    // Read the preset recorded on the session. In session format v4
+    // (dsh >= 0.1.7) the canonical reader is `sessionQuery.observeSession`
+    // (projected `agentPreset`); the older `sessionPersistence.inspect`
+    // path is retained purely as a fallback for earlier harnesses.
+    let presetId: string | undefined
+    const sessionQuery = ctx.get?.('sessionQuery') as
+      | { observeSession?(id: string): Promise<{ projections?: { values?: { agentPreset?: string } } }> }
+      | undefined
+    if (sessionQuery !== undefined && typeof sessionQuery.observeSession === 'function') {
+      const observed = await sessionQuery.observeSession(sessionId)
+      presetId = observed?.projections?.values?.agentPreset
+    } else {
+      const persistence = ctx.get?.('sessionPersistence') as
+        | { inspect?(id: string): Promise<{ meta?: { agentPreset?: string } }> }
+        | undefined
+      if (persistence === undefined || persistence.inspect === undefined) return { retryable: true }
+      const inspected = await persistence.inspect(sessionId)
+      presetId = inspected?.meta?.agentPreset
+    }
     if (typeof presetId !== 'string' || presetId === '') return {} // no preset - host composition only
+    // Bind to locals: the guards above do not narrow across the closure below,
+    // and class methods must keep their receiver (deconstructing `presets`
+    // and calling the bare function would lose `this`).
+    const resolve = presets.resolve.bind(presets)
+    const mount = presets.mount.bind(presets)
     const resolved = await resolve(presetId)
     return { setup: async (agentCtx: unknown) => { await mount(agentCtx, resolved.id) } }
   } catch (error) {
     // Early-boot service races (persistence / preset roster still loading)
-    // look like inspect/resolve failures; log the reason so a silent
+    // look like observe/inspect failures; log the reason so a silent
     // tool-less notification turn is diagnosable, and report retryable so
     // the caller retries instead of resuming a composition-less agent.
     try {
@@ -1229,7 +1259,7 @@ export async function deliverRestartNotice(ctx: any, cfg: Config, info: RestartC
   }
   const message = createUserMessage({
     content: [{ type: 'text', text: renderRestartNoticeText(isEnglishLocale(ctx), info.originSource) }],
-    source: { kind: 'plugin', plugin: 'dsh-power-button' },
+    source: { kind: 'plugin:dsh-power-button', plugin: 'dsh-power-button' },
   })
   if (cfg.notifyMode === 'inject') {
     // Durable no-wake context: visible on the session's next wake, zero cost.

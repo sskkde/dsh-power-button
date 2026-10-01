@@ -1,5 +1,20 @@
 import z from "@deepseek-ai/schemastery";
 //#region src/index.d.ts
+/**
+ * Producer-declared message source kind (session format v4).
+ * In v4 the generic `kind: 'plugin'` is rejected by the session-format
+ * admission check; every producer declares its own kind, conventionally
+ * `plugin:<name>` for third-party plugins (same shape the v3→v4 migration
+ * synthesizes for unknown plugin names).
+ */
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'plugin:dsh-power-button': {
+      kind: 'plugin:dsh-power-button';
+      plugin: string;
+    };
+  }
+}
 declare const name = "dsh-power-button";
 declare const inject: string[];
 /** Plugin configuration (editable via the profile's cordis config / settings). */
