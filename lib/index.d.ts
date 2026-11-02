@@ -1,5 +1,4 @@
 import z from "@deepseek-ai/schemastery";
-//#region src/index.d.ts
 /**
  * Producer-declared message source kind (session format v4).
  * In v4 the generic `kind: 'plugin'` is rejected by the session-format
@@ -117,7 +116,8 @@ type PendingOutcome = 'confirmed' | 'cancelled' | 'timeout';
  * busy-block apart from a confirmation that lapsed. */
 declare function renderPendingTimeoutText(en: boolean, ids: string[]): string;
 /** Render the bilingual result the model sees when the user explicitly CANCELS
- * the pending restart in the GUI. */
+ * the pending restart in the GUI. The wording is an explicit REJECTION notice:
+ * the model must understand the restart was declined and did NOT run. */
 declare function renderPendingCancelledText(en: boolean, ids: string[]): string;
 /**
  * A suspended, user-pending restart request.
@@ -247,5 +247,4 @@ declare function renderRestartNoticeText(en: boolean, originSource?: string): st
  */
 declare function deliverRestartNotice(ctx: any, cfg: Config, info: RestartConfirmation): Promise<boolean>;
 declare function apply(ctx: any, config: Config): void;
-//#endregion
 export { Config, PendingConfirm, PendingOutcome, RestartOrigin, apply, clampModelDelayMs, consumeRestartConfirmation, createPendingConfirm, deliverRestartNotice, inject, markerPath, name, peekPendingConfirm, pruneOldRestartLogs, readJsonBody, redactCommandLine, renderBusyBlockedText, renderPendingCancelledText, renderPendingTimeoutText, renderRestartNoticeText, resolvePendingConfirm, runningSessionIds, supervisorManaged, waitPendingConfirm, wantsForce, writeMarker };

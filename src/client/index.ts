@@ -9,7 +9,10 @@
  * this plugin's host half (POST /api/dsh-power-button/{restart,shutdown}),
  * so it works standalone with no dependency on any other plugin.
  */
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
+import type { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
+import type {} from '@deepseek-ai/dsh-client-ui-commands/client'
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-slots'
 import { RestartButton } from './RestartButton.tsx'
 import { RestartNotice } from './RestartNotice.tsx'
@@ -49,23 +52,9 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
   }
 }
 /**
- * Minimal host-side additions used by this plugin, declared against the
- * Cordis client context (the official runtime supplies both at boot):
- *  - `ctx.locale` — dictionary registration + active-locale snapshot;
- *  - `command/executed` — host-emitted command outcome bridge (the
- *    /shutdown confirm flow listens on it).
+ * The 0.2.x client packages supply ctx.locale, ctx.slots, and the
+ * command/executed event through their official Cordis type augmentations.
  */
-declare module '@deepseek-ai/cordis' {
-  interface Context {
-    locale: {
-      register(ns: string, dictionaries: { zh: Record<string, string>; en: Record<string, string> }): () => void
-      snapshot: { active: string }
-    }
-  }
-  interface Events {
-    'command/executed'(sessionId: string, name: string, result: unknown): void
-  }
-}
 
 /** What the power flow is doing: restarting or shutting down. */
 export type PowerAction = 'restart' | 'shutdown'
@@ -80,11 +69,11 @@ const listeners = new Set<() => void>()
 
 /** Locale service captured at apply time; used to translate module-scope
  * (non-component) error strings according to the DSH UI language. */
-let localeSvc: { snapshot: { active: string } } | undefined
+let localeSvc: Pick<LocaleRuntime, 'getLocale'> | undefined
 
 /** Translate a key in the current UI language (module scope; components use props.t). */
 export function tl(key: keyof typeof zh): string {
-  const dict = localeSvc?.snapshot.active === 'en' ? en : zh
+  const dict = localeSvc?.getLocale().active.toLowerCase().startsWith('en') ? en : zh
   return dict[key]
 }
 
@@ -428,7 +417,9 @@ function watchExternalRestarts(): ReturnType<typeof setInterval> {
     // (phase idle check mirrors the reload branches below).
     const pc = j.pendingConfirm
     if (pc && typeof pc.token === 'string') {
-      if (!isBusyRestartConfirmVisible() && phase === 'idle') {
+      // Never re-open a pending the user just cancelled: the POST that resolves
+      // it may still be in flight, so /health can report it for another tick.
+      if (pc.token !== cancelledModelToken && !isBusyRestartConfirmVisible() && phase === 'idle') {
         requestModelRestartConfirm({
           token: pc.token,
           busySessions: Array.isArray(pc.busySessions)
@@ -442,12 +433,15 @@ function watchExternalRestarts(): ReturnType<typeof setInterval> {
       // pending-confirm branch so non-pending probes behave exactly as before.
       return
     }
+    // No pending request: a suppressed cancel token (if any) is now fully
+    // settled on the host, so forget it.
+    cancelledModelToken = null
     // The pendingConfirm disappeared (another tab confirmed/cancelled, or the
     // host timed it out): close a MODEL-mode dialog we opened. Pure close —
     // the token is stale on the host, so no /cancel-pending POST (the real
     // decision already happened elsewhere).
     if (isBusyRestartConfirmVisible() && getBusyRestartSource() === 'model') {
-      cancelBusyRestartConfirm()
+      dismissBusyRestartConfirm()
     }
     // (a) an external restart completed: a DIFFERENT process answered.
     if (j.instanceId !== baseline) {
@@ -545,6 +539,10 @@ let busyConfirmSource: 'gui' | 'model' = 'gui'
 /** Present only for source === 'model': the host pending token echoed back on
  * confirm/cancel so the host can resolve the right suspended wait. */
 let busyConfirmToken: string | null = null
+/** Token the user explicitly CANCELLED: suppress re-opening that same pending
+ * while the cancel POST is in flight (the /health probe may still report it for
+ * one more tick). Cleared as soon as /health stops reporting a pending. */
+let cancelledModelToken: string | null = null
 
 function emitBusyConfirm(): void {
   for (const fn of busyConfirmListeners) fn()
@@ -573,14 +571,31 @@ export function requestModelRestartConfirm(info: { token: string; busySessions: 
   emitBusyConfirm()
 }
 
-/** Dismiss the dialog without acting. For the model path the token becomes
- * stale on the host (timeout / another tab resolved it) so this pure-close path
- * never POSTs — callers that need to actively cancel use cancelPendingRestart(). */
-export function cancelBusyRestartConfirm(): void {
+/** Hide the dialog without talking to the host. Used when the pending request
+ * already resolved elsewhere (the /health watcher saw it disappear, or this tab
+ * just confirmed it): the token is stale on the host, so POSTing would only 404. */
+function dismissBusyRestartConfirm(): void {
   busyConfirmVisible = false
   busyConfirmSource = 'gui'
   busyConfirmToken = null
   emitBusyConfirm()
+}
+
+/** User cancelled the dialog (button / Esc / veil click).
+ * - GUI path: pure close — the restart never started.
+ * - Model path: actively resolve the host's pending request as 'cancelled'
+ *   (best-effort POST), so the suspended tool/command stops immediately and the
+ *   model receives the "restart declined" result instead of waiting for the
+ *   timeout and then reporting a timeout. The token is suppressed so the
+ *   /health watcher cannot re-open the same dialog while the POST is in flight. */
+export function cancelBusyRestartConfirm(): void {
+  const token = busyConfirmToken
+  const source = busyConfirmSource
+  dismissBusyRestartConfirm()
+  if (source === 'model' && token !== null) {
+    cancelledModelToken = token
+    cancelPendingRestart(token)
+  }
 }
 
 /** Best-effort POST to /cancel-pending for a MODEL-triggered pending restart.
@@ -628,7 +643,7 @@ export function onBusyRestartChange(fn: () => void): () => void {
 export function confirmBusyRestart(): void {
   const token = busyConfirmToken
   const source = busyConfirmSource
-  cancelBusyRestartConfirm()
+  dismissBusyRestartConfirm()
   if (source === 'model' && token !== null) {
     void fetch('/api/dsh-power-button/confirm-pending', {
       method: 'POST',
@@ -690,7 +705,7 @@ export function apply(ctx: ClientContext): void {
       id: 'dsh-power-button',
       order: -20,
       locale: NS,
-      label: () => (localeSvc?.snapshot.active === 'en' ? en.power : zh.power),
+      label: () => (localeSvc?.getLocale().active.toLowerCase().startsWith('en') ? en.power : zh.power),
     }, RestartButton))
 
   // Full-screen restart/shutdown overlay (additive list slot; coexists with others).
@@ -721,9 +736,10 @@ export function apply(ctx: ClientContext): void {
       locale: NS,
     }, RestartNotice))
 
-  // /shutdown confirm dialog: the host handler signals SHUTDOWN_CONFIRM_PENDING
-  // through command/executed; this listener pops the same GUI dialog as the
-  // power button, and only a confirmed click actually shuts down.
+  // /shutdown confirm dialog: the command UI emits command/executed to the
+  // submitting browser after the host returns SHUTDOWN_CONFIRM_PENDING; this
+  // listener pops the same dialog as the power button, and only a confirmed
+  // click actually shuts down.
   ctx.effect(() => ctx.on('command/executed', (_sessionId, name, result) => {
     if (name !== 'shutdown') return
     const text = typeof (result as { text?: unknown } | undefined)?.text === 'string'

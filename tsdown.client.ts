@@ -12,14 +12,11 @@
  */
 import type { UserConfig } from 'tsdown'
 
-/** Externals resolved from the loader module table (mirror of the checkout's PLATFORM_MODULES). */
+/** Runtime requires available to a 0.2.x client module through ModuleLoader. */
 const CLIENT_EXTERNALS: readonly string[] = [
-  'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client', 'cordis',
-  '@deepseek-ai/dsh-client-ui-slots',
-  '@deepseek-ai/dsh-client-web-react',
+  'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client',
   '@deepseek-ai/dsh-client-ui-primitives',
-  '@deepseek-ai/dsh-client-schema-form',
-  '@deepseek-ai/dsh-client-runtime/client',
+  '@deepseek-ai/dsh-client-ui-slots',
 ]
 
 /** Wire/type layers a client bundle may inline. */

@@ -281,15 +281,16 @@ export function renderPendingTimeoutText(en: boolean, ids: string[]): string {
 }
 
 /** Render the bilingual result the model sees when the user explicitly CANCELS
- * the pending restart in the GUI. */
+ * the pending restart in the GUI. The wording is an explicit REJECTION notice:
+ * the model must understand the restart was declined and did NOT run. */
 export function renderPendingCancelledText(en: boolean, ids: string[]): string {
   const listed = ids.length > 0 ? ids.join(', ') : '-'
   if (en) {
-    return `Restart cancelled: the user declined the restart confirmation. `
+    return `Restart cancelled (declined by the user): the user rejected this restart confirmation, so the restart did not happen. `
       + `Other session(s) are running (${listed}) and the restart would interrupt them; `
       + `the user chose not to proceed. Wait for the sessions to finish and retry if you still need to restart.`
   }
-  return `重启已取消：用户拒绝了重启确认。`
+  return `重启已取消（用户驳回）：用户拒绝了本次重启确认，重启未执行。`
     + `其他会话正在运行（${listed}），重启会中断它们，因此用户选择不继续。`
     + `请等待会话结束后，若仍需重启再重试。`
 }
@@ -533,20 +534,18 @@ export function consumeRestartConfirmation(): RestartConfirmation | null {
 }
 
 /**
- * Resolve the port the current web server listens on. Prefer the actual
- * `--port` argument (the CLI accepts `--port 0` for an OS-assigned port, in
- * which case the real port is only known after listen — fall back to the
- * webServer service's bound address when available). The helper must wait for
- * THIS port to free; a hardcoded 3080 breaks restart on any other port
- * (e.g. the test copy on 3081).
+ * Resolve this web server's port. Prefer the 0.2.x public `webServer.port`
+ * after listen; before that, fall back to `--port`. With `--port 0`, only the
+ * bound port is authoritative, so trigger paths resolve this again on demand.
+ * A hard-coded 3080 breaks restart on any other port (e.g. the test copy on 3081).
  */
 function resolvePort(ctx: any): number {
   try {
-    const bound = ctx.webServer?.server?.address?.()
-    if (bound && typeof bound === 'object' && typeof bound.port === 'number' && bound.port > 0) {
-      return bound.port
-    }
-  } catch { /* webServer shape differs across versions */ }
+    // dsh-host-webserver 0.2.x exposes the bound listener as `port`; the
+    // underlying server instance is deliberately private.
+    const bound = ctx.webServer?.port
+    if (typeof bound === 'number' && bound > 0) return bound
+  } catch { /* webServer may not have bound yet */ }
   const argv = process.argv
   const idx = argv.indexOf('--port')
   if (idx >= 0 && idx + 1 < argv.length) {
@@ -1094,7 +1093,13 @@ function releasePowerTransition(): void {
 /** Whether the UI language is English (DSH settings `locale.preference`). */
 function isEnglishLocale(ctx: any): boolean {
   try {
-    const locale = ctx.settings?.get?.('locale') as { preference?: string } | undefined
+    // SettingsForms 0.2.x exposes the live Config values via describe(), not
+    // the removed settings.get(ns) accessor. The locale entry is not secret.
+    const forms = ctx.settings?.describe?.()
+    const entry = Array.isArray(forms)
+      ? forms.find((item: any) => item?.ns === 'locale')
+      : undefined
+    const locale = entry?.value as { preference?: string } | undefined
     const pref = typeof locale?.preference === 'string' ? locale.preference.toLowerCase() : ''
     return pref.startsWith('en')
   } catch { /* settings unavailable */ }
@@ -1416,6 +1421,10 @@ export function apply(ctx: any, config: Config) {
           if (pending === null) {
             return json(res, 404, { ok: false, error: 'no pending restart for this token' })
           }
+          // Evidence trail: the user actively declined a suspended restart.
+          try {
+            appendLog(LOG_FILE, `${new Date().toISOString()} pending restart ${token} cancelled by user (busy: ${pending.busySessions.join(', ') || '-'})\n`)
+          } catch { /* ignore */ }
           return json(res, 200, { ok: true, token })
         }
         if (sub === '/shutdown' && req.method === 'POST') {
